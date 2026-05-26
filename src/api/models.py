@@ -94,6 +94,7 @@ class HealthResponse(BaseModel):
     status: str
     enrolled_users: int
     active_sessions: int
+    denoising: bool = False
 
 
 class VersionResponse(BaseModel):

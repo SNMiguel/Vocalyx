@@ -48,6 +48,7 @@ from src.enrollment.enrollment_db import (
     enroll_user, get_enrollment, list_users, delete_user,
 )
 from src.preprocessing.audio_loader import load_and_resample
+from src.preprocessing.denoiser import denoise, is_enabled as denoiser_enabled, load_model as load_denoiser
 from src.preprocessing.normalization import rms_normalize
 from src.preprocessing.vad import apply_vad_energy
 
@@ -95,6 +96,9 @@ async def lifespan(app: FastAPI):
         auth_config=_decision_config,
         session_config=SessionConfig(),
     )
+
+    load_denoiser()
+
     logger.info("Service ready.")
     yield
     logger.info("Shutting down.")
@@ -151,6 +155,11 @@ async def _load_uploaded_audio(file: UploadFile) -> torch.Tensor:
 
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
+
+    # Denoise at original sample rate — DeepFilterNet handles internal 48kHz conversion.
+    # Applied before resampling to avoid double-resampling artifacts.
+    waveform = denoise(waveform, sr)
+
     if sr != TARGET_SR:
         waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
 
@@ -180,6 +189,7 @@ async def health():
         status="ok",
         enrolled_users=len(list_users()),
         active_sessions=len(_session_manager._sessions) if _session_manager else 0,
+        denoising=denoiser_enabled(),
     )
 
 
