@@ -19,10 +19,11 @@ Vocalyx is built around a different assumption: **reality is messy, and security
 - 🌍 **Cross-language authentication** — enroll in one language, authenticate in another
 - 🎧 **Device-agnostic** — works across phone mics, AirPods, Android earbuds, wired headsets
 - 🤒 **Vocal condition resilient** — handles illness, fatigue, emotional speech
-- 🛡️ **Anti-deepfake defense** — detects modern TTS synthesis (ElevenLabs, VALL-E, Bark, etc.)
-- 🔁 **Replay attack detection**
+- 🛡️ **Anti-deepfake defense** — spectral feature detection against TTS synthesis (ElevenLabs, VALL-E, Bark, etc.)
+- 🔁 **Replay attack detection** — reverb tail, sub-band energy, and noise floor analysis
+- 🔐 **Session management** — retry escalation, step-up auth, and lockout
 - 🧩 **Modular architecture** — swap any component as better models emerge
-- 🌐 **Accent-diverse** — trained and evaluated on global speech datasets
+- 🌐 **Accent-diverse** — language-adaptive scoring thresholds per region
 
 ---
 
@@ -31,16 +32,29 @@ Vocalyx is built around a different assumption: **reality is messy, and security
 ```
 Audio Input
     ↓
-Preprocessing (VAD, normalization, resampling)
+Preprocessing (VAD · RMS normalize · resample to 16kHz)
     ↓
-┌──────────────────────┬──────────────────────┐
-│ Speaker Verification │  Anti-Spoofing       │
-│ (multilingual)       │  (deepfake + replay) │
-└──────────────────────┴──────────────────────┘
-    ↓                            ↓
-       Decision Fusion Layer
-              ↓
-       Accept / Reject / Retry
+┌───────────────────────────┬──────────────────────────────┐
+│  Speaker Verification     │  Anti-Spoofing               │
+│  ECAPA-TDNN (primary)     │  Deepfake detector           │
+│  WavLM · XLS-R · MMS      │    spectral flatness         │
+│  (multilingual fusion)    │    HNR · pitch jitter        │
+│                           │    MFCC delta variance       │
+│  Channel normalization    │  Replay detector             │
+│  CMVN · WCCN              │    reverb tail energy        │
+│                           │    sub-band ratio            │
+│  Channel mismatch check   │    noise floor · spec flux   │
+└───────────────────────────┴──────────────────────────────┘
+                    ↓
+           Decision Fusion Layer
+      (adaptive SV threshold · spoof score)
+                    ↓
+     ACCEPT / REJECT / RETRY / STEP_UP
+                    ↓
+           Session Manager
+    (retry escalation · lockout · history)
+                    ↓
+           FastAPI REST Service
 ```
 
 ---
@@ -49,20 +63,22 @@ Preprocessing (VAD, normalization, resampling)
 
 - **Python 3.10+**
 - **PyTorch** + **torchaudio**
-- **Hugging Face Transformers**
-- **SpeechBrain** — speaker recognition toolkit
-- **pyannote.audio** — embeddings + VAD
-- **FastAPI** — inference API
-- **librosa**, **soundfile** — audio processing
+- **SpeechBrain** — ECAPA-TDNN speaker embeddings
+- **Hugging Face Transformers** — WavLM, XLS-R, MMS, Whisper
+- **FastAPI** + **uvicorn** — inference REST service
+- **soundfile** — audio I/O (no FFmpeg dependency)
+- **pytest** — 141-test suite across 8 modules
 
-### Models Used
+### Models
 
 | Component | Model |
 |---|---|
-| Speaker embeddings | `speechbrain/spkrec-ecapa-voxceleb` |
+| Speaker embeddings (primary) | `speechbrain/spkrec-ecapa-voxceleb` |
 | Multilingual embeddings | `microsoft/wavlm-base-plus-sv` |
-| Foundation model | `facebook/wav2vec2-xls-r-300m` |
-| Anti-spoofing | AASIST / RawNet3 |
+| Cross-lingual embeddings | `facebook/wav2vec2-xls-r-300m` |
+| Massively multilingual | `facebook/mms-1b` |
+| Language detection | `openai/whisper-base` |
+| HF anti-spoof (optional) | `jungjee/HuBERT-base-AS` |
 
 ---
 
@@ -82,25 +98,67 @@ Preprocessing (VAD, normalization, resampling)
 
 ### Prerequisites
 
-- Python 3.10 or higher
-- pip
-- (Optional) CUDA-capable GPU for training
+- [Anaconda](https://www.anaconda.com/) or Miniconda
+- Python 3.10
 
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/vocalyx.git
-cd vocalyx
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+git clone https://github.com/SNMiguel/Vocalyx.git
+cd Vocalyx
+
+conda create -n voice-biometrics python=3.10 -y
+conda activate voice-biometrics
 pip install -r requirements.txt
 ```
 
-### Quick Start
+### Run the API server
 
 ```bash
-# Run baseline verification on sample audio
-python -m src.verification.speaker_verifier --enroll sample1.wav --verify sample2.wav
+conda activate voice-biometrics
+python run_server.py
+# API available at http://localhost:8000
+# Docs at http://localhost:8000/docs
+```
+
+### Enroll a user and authenticate
+
+```bash
+# Enroll
+curl -X POST http://localhost:8000/enroll \
+  -F "user_id=alice" \
+  -F "files=@enroll.wav"
+
+# Start a session
+curl -X POST http://localhost:8000/sessions \
+  -F "user_id=alice"
+
+# Authenticate (use session_id from above)
+curl -X POST http://localhost:8000/authenticate \
+  -F "session_id=<session_id>" \
+  -F "file=@probe.wav"
+```
+
+---
+
+## 🧪 Running Tests
+
+```bash
+conda activate voice-biometrics
+
+# Fast suite (no model downloads)
+pytest tests/ -m "not slow" -q
+
+# Full suite including multilingual model tests
+pytest tests/ -q
+```
+
+### Run the end-to-end validation
+
+```bash
+PYTHONPATH=. python src/evaluation/validate.py
+# Exercises all 11 pipeline components
+# Saves report to data/validation_report.json
 ```
 
 ---
@@ -109,35 +167,72 @@ python -m src.verification.speaker_verifier --enroll sample1.wav --verify sample
 
 ```
 vocalyx/
-├── data/                  # Audio datasets and test matrix
+├── configs/
+│   ├── api.yaml            # Server and pipeline config
+│   └── baseline.yaml       # SV model and threshold defaults
 ├── src/
-│   ├── preprocessing/     # Audio loading, VAD, normalization
-│   ├── enrollment/        # User enrollment + embedding storage
-│   ├── verification/      # Speaker verification logic
-│   ├── antispoofing/      # Deepfake + replay detection
-│   ├── decision/          # Score fusion layer
-│   ├── evaluation/        # Metrics and benchmarking
-│   └── api/               # FastAPI inference service
-├── notebooks/             # Experiments and analysis
-├── tests/                 # Unit and integration tests
-├── configs/               # Model configurations
-└── docs/                  # Documentation
+│   ├── preprocessing/      # Audio loading, VAD, normalization,
+│   │                       # augmentation, CMVN/WCCN, channel norm
+│   ├── enrollment/         # ECAPA-TDNN embedder, .pt enrollment DB
+│   ├── verification/       # Speaker verifier, multilingual backends,
+│   │                       # language-adaptive scoring
+│   ├── antispoofing/       # Deepfake detector, replay detector,
+│   │                       # channel mismatch, anti-spoof fusion
+│   ├── decision/           # Auth decision fusion, session manager
+│   ├── evaluation/         # EER/FAR/FRR metrics, benchmark runner,
+│   │                       # end-to-end validation
+│   └── api/                # FastAPI server and Pydantic models
+├── tests/                  # 141 tests across all 8 phases
+├── run_server.py           # Uvicorn entrypoint
+└── requirements.txt
 ```
 
-See [`docs/PROJECT_BRIEF.md`](docs/PROJECT_BRIEF.md) for the full technical brief.
+---
+
+## 🌐 API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/enroll` | Enroll a user with one or more audio files |
+| `POST` | `/sessions` | Start an authentication session |
+| `POST` | `/authenticate` | Submit a probe audio for a session |
+| `GET` | `/sessions/{id}` | Get session status and attempt history |
+| `GET` | `/users/{id}` | Check if a user is enrolled |
+| `DELETE` | `/users/{id}` | Remove a user's enrollment |
+| `GET` | `/health` | Service liveness check |
+| `GET` | `/version` | Pipeline version and component list |
+
+Interactive docs available at `/docs` when the server is running.
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] **Phase 1:** Baseline speaker verification pipeline
-- [ ] **Phase 2:** Evaluation framework and test matrix
-- [ ] **Phase 3:** Cross-language and accent robustness
-- [ ] **Phase 4:** Device and channel robustness
-- [ ] **Phase 5:** Anti-spoofing and deepfake detection
-- [ ] **Phase 6:** Decision fusion and adaptive logic
-- [ ] **Phase 7:** API and production readiness
-- [ ] **Phase 8:** Final validation and reporting
+- [x] **Phase 1:** Baseline speaker verification pipeline
+- [x] **Phase 2:** Evaluation framework and test matrix
+- [x] **Phase 3:** Cross-language and accent robustness
+- [x] **Phase 4:** Device and channel robustness
+- [x] **Phase 5:** Anti-spoofing and deepfake detection
+- [x] **Phase 6:** Decision fusion and adaptive logic
+- [x] **Phase 7:** API and production readiness
+- [x] **Phase 8:** Final validation and reporting
+
+### Known Limitations
+
+- Spectral anti-spoof calibrated against ASVspoof 2019 LA; degrades on 2024 challenge attacks and unseen TTS systems
+- WCCN requires ≥ 2 samples per speaker at dev time; unavailable at cold start
+- Enrollment DB is a flat `.pt` file — not safe for concurrent writes in multi-worker deployments
+- Session state is in-process only; lost on server restart
+- Multilingual embedders (WavLM, XLS-R, MMS) are lazy-loaded; first request triggers a model download
+
+### Next Steps
+
+- Benchmark against VoxCeleb1-H (hard) and ASVspoof 2024
+- Validate `jungjee/HuBERT-base-AS` end-to-end on real spoofed audio
+- Collect real device audio and tune channel mismatch thresholds
+- Replace flat `.pt` DB with SQLite or Redis for concurrent safety
+- Add GPU batching and request queuing for production throughput
+- GDPR / biometric compliance review before production deployment
 
 ---
 
