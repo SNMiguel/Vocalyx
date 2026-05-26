@@ -2,6 +2,7 @@ import { useState, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { startSession, authenticate } from '../api'
 import DecisionCard from '../components/DecisionCard'
+import { useAudioRecorder } from '../hooks/useAudioRecorder'
 
 export default function Authenticate() {
   const { user, token } = useAuth()
@@ -10,12 +11,14 @@ export default function Authenticate() {
   const [userId, setUserId] = useState(user?.username ?? '')
   const [sessionId, setSessionId] = useState(null)
   const [probeFile, setProbeFile] = useState(null)
+  const [probeMode, setProbeMode] = useState('record') // 'record' | 'upload'
   const [dragging, setDragging] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const [step, setStep] = useState(1) // 1=start, 2=upload, 3=result
+  const [step, setStep] = useState(1) // 1=start, 2=probe, 3=result
   const fileRef = useRef()
+  const { recording, elapsed, micError, start, stop } = useAudioRecorder()
 
   const handleStartSession = async () => {
     if (!userId.trim()) return setError('User ID is required.')
@@ -68,6 +71,16 @@ export default function Authenticate() {
     }
   }
 
+  const handleStopRecording = async () => {
+    const result = await stop()
+    if (!result) return
+    const { wavBlob, duration } = result
+    const file = new File([wavBlob], `probe_${Date.now()}.wav`, { type: 'audio/wav' })
+    file._previewUrl = URL.createObjectURL(wavBlob)
+    file._duration = duration
+    setProbeFile(file)
+  }
+
   return (
     <>
       <div className="page-header">
@@ -87,7 +100,7 @@ export default function Authenticate() {
           <div className="step-sep" />
           <div className={`step ${step >= 2 ? (step > 2 ? 'done' : 'active') : ''}`}>
             <span className="step-num">{step > 2 ? '✓' : '2'}</span>
-            <span>Upload probe</span>
+            <span>Probe audio</span>
           </div>
           <div className="step-sep" />
           <div className={`step ${step >= 3 ? 'active' : ''}`}>
@@ -124,7 +137,7 @@ export default function Authenticate() {
           </div>
         )}
 
-        {/* Step 2: Upload probe */}
+        {/* Step 2: Probe audio */}
         {step === 2 && (
           <div className="card">
             <div className="card-body">
@@ -137,35 +150,68 @@ export default function Authenticate() {
 
               <div className="form-group">
                 <label className="form-label">Probe audio</label>
-                <div
-                  className={`drop-zone${dragging ? ' dragging' : ''}`}
-                  onClick={() => fileRef.current.click()}
-                  onDragOver={e => { e.preventDefault(); setDragging(true) }}
-                  onDragLeave={() => setDragging(false)}
-                  onDrop={e => { e.preventDefault(); setDragging(false); setFile(e.dataTransfer.files[0]) }}
-                  style={{ padding: '24px' }}
-                >
-                  {probeFile ? (
-                    <>
-                      <div className="drop-zone-icon">🎵</div>
-                      <div className="drop-zone-text">{probeFile.name}</div>
-                      <div className="drop-zone-sub">Click to change</div>
-                    </>
-                  ) : (
-                    <>
-                      <div className="drop-zone-icon">🎙</div>
-                      <div className="drop-zone-text">Drop probe audio or click to browse</div>
-                      <div className="drop-zone-sub">WAV · MP3 · FLAC</div>
-                    </>
-                  )}
+
+                {/* Mode tabs */}
+                <div className="tab-bar" style={{ marginBottom: 12 }}>
+                  <button className={`tab-btn${probeMode === 'record' ? ' active' : ''}`} onClick={() => { setProbeMode('record'); setProbeFile(null) }}>
+                    🎙 Record
+                  </button>
+                  <button className={`tab-btn${probeMode === 'upload' ? ' active' : ''}`} onClick={() => { setProbeMode('upload'); setProbeFile(null) }}>
+                    📁 Upload
+                  </button>
                 </div>
-                <input
-                  ref={fileRef}
-                  type="file"
-                  accept="audio/*"
-                  style={{ display: 'none' }}
-                  onChange={e => setFile(e.target.files[0])}
-                />
+
+                {probeMode === 'record' ? (
+                  <div>
+                    {micError && <div className="alert alert-error" style={{ marginBottom: 8 }}>⚠ {micError}</div>}
+                    <div className="record-zone" style={{ marginBottom: 12 }}>
+                      <button
+                        className={`record-btn${recording ? ' recording' : ''}`}
+                        onClick={recording ? handleStopRecording : start}
+                        title={recording ? 'Stop' : 'Start recording'}
+                      >
+                        {recording ? '⏹' : '●'}
+                      </button>
+                      <div className="record-label">
+                        {recording
+                          ? <span className="record-live">Recording… {elapsed.toFixed(1)}s</span>
+                          : probeFile
+                            ? <span className="text-muted">Recording ready — re-record to replace</span>
+                            : <span className="text-muted">Say a few sentences in your natural voice</span>
+                        }
+                      </div>
+                    </div>
+                    {probeFile?._previewUrl && (
+                      <audio src={probeFile._previewUrl} controls style={{ width: '100%', marginTop: 4 }} />
+                    )}
+                  </div>
+                ) : (
+                  <div>
+                    <div
+                      className={`drop-zone${dragging ? ' dragging' : ''}`}
+                      onClick={() => fileRef.current.click()}
+                      onDragOver={e => { e.preventDefault(); setDragging(true) }}
+                      onDragLeave={() => setDragging(false)}
+                      onDrop={e => { e.preventDefault(); setDragging(false); setFile(e.dataTransfer.files[0]) }}
+                      style={{ padding: '24px' }}
+                    >
+                      {probeFile ? (
+                        <>
+                          <div className="drop-zone-icon">🎵</div>
+                          <div className="drop-zone-text">{probeFile.name}</div>
+                          <div className="drop-zone-sub">Click to change</div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="drop-zone-icon">🎙</div>
+                          <div className="drop-zone-text">Drop probe audio or click to browse</div>
+                          <div className="drop-zone-sub">WAV · MP3 · FLAC</div>
+                        </>
+                      )}
+                    </div>
+                    <input ref={fileRef} type="file" accept="audio/*" style={{ display: 'none' }} onChange={e => setFile(e.target.files[0])} />
+                  </div>
+                )}
               </div>
 
               <div className="flex gap-2">
