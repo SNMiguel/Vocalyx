@@ -380,6 +380,19 @@ h3 { font-size: 0.9375rem; font-weight: 600; }
 .record-label { font-size: 0.875rem; text-align: center; }
 .record-live { color: var(--reject); font-weight: 600; }
 
+.mic-level-bar {
+  display: flex;
+  gap: 3px;
+  align-items: flex-end;
+  height: 24px;
+}
+.mic-level-seg {
+  width: 6px;
+  height: 100%;
+  border-radius: 2px;
+  transition: opacity 0.05s;
+}
+
 /* ── duration bar ────────────────────────────── */
 .duration-wrap { margin-bottom: 16px; }
 .duration-header {

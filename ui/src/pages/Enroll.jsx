@@ -35,7 +35,7 @@ export default function Enroll() {
 
   // Record state
   const [clips, setClips] = useState([])  // [{blob, duration, url, name}]
-  const { recording, elapsed, micError, start, stop } = useAudioRecorder()
+  const { recording, elapsed, micError, micLevel, start, stop } = useAudioRecorder()
 
   // Shared
   const [status, setStatus] = useState(null)
@@ -165,7 +165,7 @@ export default function Enroll() {
                 <div className="alert alert-error" style={{ marginBottom: 12 }}>⚠ {micError}</div>
               )}
 
-              {/* Record button */}
+              {/* Record button + mic level */}
               <div className="record-zone">
                 <button
                   className={`record-btn${recording ? ' recording' : ''}`}
@@ -174,6 +174,20 @@ export default function Enroll() {
                 >
                   {recording ? '⏹' : '●'}
                 </button>
+                {recording && (
+                  <div className="mic-level-bar">
+                    {Array.from({ length: 12 }).map((_, i) => (
+                      <div
+                        key={i}
+                        className="mic-level-seg"
+                        style={{
+                          opacity: micLevel > (i / 12) * 100 ? 1 : 0.15,
+                          background: i < 8 ? 'var(--accept)' : 'var(--retry)',
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
                 <div className="record-label">
                   {recording
                     ? <span className="record-live">Recording… {fmtTime(elapsed)}</span>

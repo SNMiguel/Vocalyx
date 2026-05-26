@@ -18,7 +18,7 @@ export default function Authenticate() {
   const [loading, setLoading] = useState(false)
   const [step, setStep] = useState(1) // 1=start, 2=probe, 3=result
   const fileRef = useRef()
-  const { recording, elapsed, micError, start, stop } = useAudioRecorder()
+  const { recording, elapsed, micError, micLevel, start, stop } = useAudioRecorder()
 
   const handleStartSession = async () => {
     if (!userId.trim()) return setError('User ID is required.')
@@ -172,6 +172,20 @@ export default function Authenticate() {
                       >
                         {recording ? '⏹' : '●'}
                       </button>
+                      {recording && (
+                        <div className="mic-level-bar">
+                          {Array.from({ length: 12 }).map((_, i) => (
+                            <div
+                              key={i}
+                              className="mic-level-seg"
+                              style={{
+                                opacity: micLevel > (i / 12) * 100 ? 1 : 0.15,
+                                background: i < 8 ? 'var(--accept)' : 'var(--retry)',
+                              }}
+                            />
+                          ))}
+                        </div>
+                      )}
                       <div className="record-label">
                         {recording
                           ? <span className="record-live">Recording… {elapsed.toFixed(1)}s</span>
