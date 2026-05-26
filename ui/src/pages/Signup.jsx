@@ -1,28 +1,32 @@
 import { useState } from 'react'
-import { useNavigate, useLocation } from 'react-router-dom'
-import { useAuth } from '../contexts/AuthContext'
-import { login } from '../api'
+import { useNavigate } from 'react-router-dom'
+import { register } from '../api'
 
-export default function Login() {
-  const { login: setAuth } = useAuth()
+export default function Signup() {
   const navigate = useNavigate()
-  const location = useLocation()
-  const justRegistered = location.state?.registered
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
   const submit = async (e) => {
     e.preventDefault()
     setError('')
+    if (password !== confirm) {
+      setError('Passwords do not match.')
+      return
+    }
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.')
+      return
+    }
     setLoading(true)
     try {
-      const data = await login(username, password)
-      setAuth(data.access_token, { username: data.username, role: data.role })
-      navigate('/')
+      await register(username, password)
+      navigate('/login', { state: { registered: true } })
     } catch (err) {
-      setError(err.message || 'Login failed')
+      setError(err.message || 'Registration failed')
     } finally {
       setLoading(false)
     }
@@ -34,14 +38,8 @@ export default function Login() {
         <div className="login-logo">
           <span className="login-logo-icon">🎙️</span>
           <div className="login-logo-name">Vocalyx</div>
-          <div className="login-logo-sub">Voice Biometrics Dashboard</div>
+          <div className="login-logo-sub">Create your account</div>
         </div>
-
-        {justRegistered && (
-          <div className="alert alert-success">
-            Account created — sign in to continue.
-          </div>
-        )}
 
         {error && (
           <div className="alert alert-error">
@@ -70,9 +68,22 @@ export default function Login() {
               id="password"
               className="form-input"
               type="password"
-              autoComplete="current-password"
+              autoComplete="new-password"
               value={password}
               onChange={e => setPassword(e.target.value)}
+              required
+            />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label" htmlFor="confirm">Confirm password</label>
+            <input
+              id="confirm"
+              className="form-input"
+              type="password"
+              autoComplete="new-password"
+              value={confirm}
+              onChange={e => setConfirm(e.target.value)}
               required
             />
           </div>
@@ -83,19 +94,19 @@ export default function Login() {
             disabled={loading}
             style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}
           >
-            {loading ? 'Signing in…' : 'Sign in'}
+            {loading ? 'Creating account…' : 'Create account'}
           </button>
         </form>
 
-        <p className="text-muted text-sm" style={{ textAlign: 'center', marginTop: 20 }}>
-          Default credentials are set in <code>configs/api.yaml</code>
+        <p className="text-muted text-sm" style={{ textAlign: 'center', marginTop: 16 }}>
+          Already have an account?{' '}
+          <a href="/login" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 500 }}>
+            Sign in
+          </a>
         </p>
 
-        <p className="text-muted text-sm" style={{ textAlign: 'center', marginTop: 12 }}>
-          Don't have an account?{' '}
-          <a href="/signup" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 500 }}>
-            Create one
-          </a>
+        <p className="text-muted text-sm" style={{ textAlign: 'center', marginTop: 8 }}>
+          New accounts start with the <strong>user</strong> role. An admin can promote you later.
         </p>
       </div>
     </div>

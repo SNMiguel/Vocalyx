@@ -31,7 +31,23 @@ export const login = (username, password) =>
     body: JSON.stringify({ username, password }),
   })
 
+export const register = (username, password) =>
+  request('/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  })
+
 export const getMe = (token) => request('/auth/me', {}, token)
+
+// App user management (admin only)
+export const listAppUsers = (token) => request('/auth/users', {}, token)
+export const updateUserRole = (username, role, token) =>
+  request(`/auth/users/${encodeURIComponent(username)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ role }),
+  }, token)
+export const deleteAppUser = (username, token) =>
+  request(`/auth/users/${encodeURIComponent(username)}`, { method: 'DELETE' }, token)
 
 // Health
 export const getHealth = () => request('/health')

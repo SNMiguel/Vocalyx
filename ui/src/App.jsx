@@ -3,10 +3,12 @@ import { AuthProvider } from './contexts/AuthContext'
 import ProtectedRoute from './components/ProtectedRoute'
 import Layout from './components/Layout'
 import Login from './pages/Login'
+import Signup from './pages/Signup'
 import Enroll from './pages/Enroll'
 import Authenticate from './pages/Authenticate'
 import Sessions from './pages/Sessions'
 import Users from './pages/Users'
+import AppUsers from './pages/AppUsers'
 
 export default function App() {
   return (
@@ -14,6 +16,7 @@ export default function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/signup" element={<Signup />} />
           <Route
             path="/*"
             element={
@@ -36,6 +39,14 @@ export default function App() {
                       element={
                         <ProtectedRoute roles={['admin']}>
                           <Users />
+                        </ProtectedRoute>
+                      }
+                    />
+                    <Route
+                      path="/app-users"
+                      element={
+                        <ProtectedRoute roles={['admin']}>
+                          <AppUsers />
                         </ProtectedRoute>
                       }
                     />

@@ -58,6 +58,7 @@ export default function Layout({ children }) {
             <>
               <span className="sidebar-section">Admin</span>
               <SidebarLink to="/users" icon="👤" label="Voice Users" />
+              <SidebarLink to="/app-users" icon="🔑" label="App Users" />
             </>
           )}
         </aside>
