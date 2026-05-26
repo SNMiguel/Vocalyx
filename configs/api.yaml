@@ -5,6 +5,12 @@ server:
   reload: false        # set true for development hot-reload
   log_level: info
 
+auth:
+  admin_username: admin
+  admin_password: admin123        # change before production
+  secret_key: change-me-in-production-use-a-long-random-string
+  token_expire_minutes: 60
+
 pipeline:
   sv_model: speechbrain/spkrec-ecapa-voxceleb
   embedder_backend: ecapa   # ecapa | wavlm | xlsr | mms
