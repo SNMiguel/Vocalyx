@@ -46,7 +46,15 @@ export function useAudioRecorder() {
   const start = useCallback(async () => {
     setMicError('')
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      // Disable browser's built-in DSP so our backend denoiser gets raw audio
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+        video: false,
+      })
       const mr = new MediaRecorder(stream)
       mrRef.current = mr
       chunksRef.current = []
