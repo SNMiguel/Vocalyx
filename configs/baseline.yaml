@@ -1,0 +1,15 @@
+preprocessing:
+  target_sample_rate: 16000
+  rms_target_db: -23.0
+  vad_mode: energy          # options: energy | silero
+  vad_threshold_db: -40.0
+
+speaker_verification:
+  model: speechbrain/spkrec-ecapa-voxceleb
+  embedding_dim: 192
+  threshold: 0.25           # cosine similarity; tune to hit target EER
+
+enrollment:
+  db_path: data/enrollment_db.pt
+  min_samples: 1
+  max_samples: 5

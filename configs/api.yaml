@@ -1,0 +1,27 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  workers: 1           # increase for production; model is loaded per-worker
+  reload: false        # set true for development hot-reload
+  log_level: info
+
+pipeline:
+  sv_model: speechbrain/spkrec-ecapa-voxceleb
+  embedder_backend: ecapa   # ecapa | wavlm | xlsr | mms
+  decision:
+    sv_accept_threshold: 0.25
+    sv_retry_threshold: 0.15
+    spoof_reject_threshold: 0.50
+    spoof_retry_threshold: 0.35
+    sv_threshold_range: 0.05
+    enable_step_up: true
+
+session:
+  max_attempts: 4
+  step_up_after: 2
+  session_timeout_seconds: 300
+  lockout_duration_seconds: 600
+
+limits:
+  max_audio_bytes: 52428800   # 50 MB
+  max_enroll_samples: 5
