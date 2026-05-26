@@ -64,6 +64,7 @@ _decision_config: DecisionConfig | None = None
 
 TARGET_SR = 16000
 MAX_AUDIO_BYTES = 50 * 1024 * 1024   # 50 MB
+MIN_ENROLL_SPEECH_SECONDS = 10.0     # minimum total speech time after VAD
 
 
 @asynccontextmanager
@@ -210,10 +211,23 @@ async def enroll(
         raise HTTPException(status_code=400, detail="At least one audio file required.")
 
     embeddings = []
+    total_speech_samples = 0
     for f in files:
         waveform = await _load_uploaded_audio(f)
+        total_speech_samples += waveform.shape[-1]
         emb = get_embedding(waveform)
         embeddings.append(emb)
+
+    total_speech_seconds = total_speech_samples / TARGET_SR
+    if total_speech_seconds < MIN_ENROLL_SPEECH_SECONDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Not enough voice data: {total_speech_seconds:.1f}s of speech detected "
+                f"after noise removal (minimum {MIN_ENROLL_SPEECH_SECONDS:.0f}s required). "
+                "Please record or upload more audio."
+            ),
+        )
 
     enroll_user(user_id, embeddings)
     logger.info(f"Enrolled user '{user_id}' with {len(embeddings)} sample(s) by '{current_user['username']}'.")
