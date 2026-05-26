@@ -46,10 +46,19 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     username: str
+    role: str
+
+
+class UpdateRoleRequest(BaseModel):
     role: str
 
 
@@ -126,3 +135,42 @@ async def login(body: LoginRequest):
 async def me(current_user: dict = Depends(get_current_user)):
     """Return the currently authenticated user's info."""
     return current_user
+
+
+@router.post("/register", status_code=201)
+async def register(body: RegisterRequest):
+    """Public endpoint — create a new account with the default 'user' role."""
+    from src.api.app_db import create_user
+    try:
+        create_user(body.username, body.password, role="user")
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return {"username": body.username, "role": "user"}
+
+
+@router.get("/users", dependencies=[Depends(require_role("admin"))])
+async def list_users():
+    """Admin only — list all app accounts."""
+    from src.api.app_db import list_app_users
+    return {"users": list_app_users()}
+
+
+@router.patch("/users/{username}", dependencies=[Depends(require_role("admin"))])
+async def change_role(username: str, body: UpdateRoleRequest):
+    """Admin only — change a user's role."""
+    from src.api.app_db import update_role
+    try:
+        update_role(username, body.role)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return {"username": username, "role": body.role}
+
+
+@router.delete("/users/{username}", status_code=204, dependencies=[Depends(require_role("admin"))])
+async def remove_user(username: str):
+    """Admin only — delete an app account."""
+    from src.api.app_db import delete_app_user
+    try:
+        delete_app_user(username)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))

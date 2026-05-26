@@ -101,3 +101,25 @@ def list_app_users() -> list[dict]:
             "SELECT username, role FROM app_users ORDER BY username"
         ).fetchall()
     return [{"username": r["username"], "role": r["role"]} for r in rows]
+
+
+def update_role(username: str, role: str) -> None:
+    """Change a user's role. Raises ValueError if user not found."""
+    if role not in ("admin", "ops", "user"):
+        raise ValueError(f"Invalid role: {role}")
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE app_users SET role = ? WHERE username = ?", (role, username)
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"User '{username}' not found.")
+
+
+def delete_app_user(username: str) -> None:
+    """Delete an app user. Raises ValueError if user not found."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM app_users WHERE username = ?", (username,)
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"User '{username}' not found.")
