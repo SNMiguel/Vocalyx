@@ -17,6 +17,7 @@ from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
 from src.api.server import app
+from src.api.auth_router import get_current_user
 from src.decision.fusion_layer import AuthDecision, AuthResult, DecisionConfig
 from src.antispoofing.fusion import FusionResult, SpoofDecision
 from src.antispoofing.deepfake_detector import SpoofResult
@@ -72,9 +73,11 @@ def _make_auth_result(decision=AuthDecision.ACCEPT, sv_score=0.8, spoof_score=0.
 
 @pytest.fixture
 def client():
-    """TestClient with mocked enrollment DB."""
+    """TestClient with mocked auth (admin) and mocked enrollment DB."""
+    app.dependency_overrides[get_current_user] = lambda: {"username": "test_admin", "role": "admin"}
     with TestClient(app) as c:
         yield c
+    app.dependency_overrides.clear()
 
 
 # ── health / version ──────────────────────────────────────────────────────────

@@ -2,14 +2,17 @@
 Voice Biometrics FastAPI inference service.
 
 Endpoints:
-  POST /enroll                  Upload audio to enroll a user
-  POST /authenticate            Authenticate a user claim against a session
-  POST /sessions                Start a new authentication session
-  GET  /sessions/{session_id}   Get session status and attempt history
-  GET  /users/{user_id}         Check if a user is enrolled
-  DELETE /users/{user_id}       Remove a user's enrollment
-  GET  /health                  Service health check
-  GET  /version                 Pipeline version info
+  POST /auth/login               Get a JWT access token
+  GET  /auth/me                  Current user info
+  POST /enroll                   Upload audio to enroll a user
+  POST /authenticate             Authenticate a user claim against a session
+  POST /sessions                 Start a new authentication session
+  GET  /sessions                 List all sessions (ops/admin)
+  GET  /sessions/{session_id}    Get session status and attempt history
+  GET  /users/{user_id}          Check if a user is enrolled
+  DELETE /users/{user_id}        Remove a user's enrollment (admin only)
+  GET  /health                   Service health check
+  GET  /version                  Pipeline version info
 """
 
 from __future__ import annotations
@@ -19,21 +22,25 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Optional
 
 import torch
 import torchaudio
 import soundfile as sf
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+import yaml
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from src.api.models import (
     AuthResponse, DeleteUserResponse, EnrollResponse, HealthResponse,
     SessionResponse, SpoofDetail, UserStatusResponse, VersionResponse,
     AttemptSummary, AuthDecisionEnum, SpoofDecisionEnum,
 )
+from src.api.auth_router import router as auth_router, get_current_user, require_role
+import src.api.auth_router as _auth_mod
+from src.api.app_db import init_db
 from src.decision.fusion_layer import DecisionConfig, make_auth_decision
 from src.decision.session import SessionManager, SessionConfig
 from src.enrollment.embedder import get_embedding
@@ -62,7 +69,26 @@ MAX_AUDIO_BYTES = 50 * 1024 * 1024   # 50 MB
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _session_manager, _decision_config
+
     logger.info("Starting voice biometrics service...")
+
+    # Load config
+    cfg: dict = {}
+    config_path = Path("configs/api.yaml")
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+
+    auth_cfg = cfg.get("auth", {})
+    _auth_mod.configure(
+        secret_key=auth_cfg.get("secret_key", "change-me"),
+        expire_minutes=auth_cfg.get("token_expire_minutes", 60),
+    )
+    init_db(
+        admin_username=auth_cfg.get("admin_username", "admin"),
+        admin_password=auth_cfg.get("admin_password", "admin123"),
+    )
+
     _decision_config = DecisionConfig()
     _session_manager = SessionManager(
         auth_config=_decision_config,
@@ -79,6 +105,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.include_router(auth_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -97,9 +125,7 @@ async def log_requests(request: Request, call_next):
     logger.info(f"[{request_id}] {request.method} {request.url.path}")
     response = await call_next(request)
     elapsed = (time.perf_counter() - start) * 1000
-    logger.info(
-        f"[{request_id}] {response.status_code} {elapsed:.1f}ms"
-    )
+    logger.info(f"[{request_id}] {response.status_code} {elapsed:.1f}ms")
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Response-Time-Ms"] = f"{elapsed:.1f}"
     return response
@@ -118,15 +144,10 @@ async def _load_uploaded_audio(file: UploadFile) -> torch.Tensor:
     try:
         buffer = io.BytesIO(content)
         data, sr = sf.read(buffer, dtype="float32", always_2d=True)
-        # soundfile returns (samples, channels) — transpose to (channels, samples)
         waveform = torch.from_numpy(data.T)
     except Exception as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not decode audio file: {e}",
-        )
+        raise HTTPException(status_code=422, detail=f"Could not decode audio file: {e}")
 
-    # Mono + resample
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if sr != TARGET_SR:
@@ -153,7 +174,7 @@ def _spoof_detail(fusion_result) -> SpoofDetail:
 
 @app.get("/health", response_model=HealthResponse, tags=["Service"])
 async def health():
-    """Service liveness and basic stats."""
+    """Service liveness — public, no auth required."""
     return HealthResponse(
         status="ok",
         enrolled_users=len(list_users()),
@@ -163,6 +184,7 @@ async def health():
 
 @app.get("/version", response_model=VersionResponse, tags=["Service"])
 async def version():
+    """Pipeline version — public, no auth required."""
     return VersionResponse(
         version="1.0.0",
         pipeline_phases=[
@@ -181,14 +203,9 @@ async def enroll(
     user_id: Annotated[str, Form()],
     files: Annotated[list[UploadFile], File()],
     language: Annotated[Optional[str], Form()] = "default",
+    current_user: dict = Depends(get_current_user),
 ):
-    """
-    Enroll a user with one or more audio samples.
-
-    - **user_id**: unique identifier for the user
-    - **files**: one or more WAV/MP3 audio files (16kHz recommended)
-    - **language**: spoken language hint (for future threshold tuning)
-    """
+    """Enroll a user with one or more audio samples. Requires authentication."""
     if not files:
         raise HTTPException(status_code=400, detail="At least one audio file required.")
 
@@ -199,7 +216,7 @@ async def enroll(
         embeddings.append(emb)
 
     enroll_user(user_id, embeddings)
-    logger.info(f"Enrolled user '{user_id}' with {len(embeddings)} sample(s).")
+    logger.info(f"Enrolled user '{user_id}' with {len(embeddings)} sample(s) by '{current_user['username']}'.")
 
     return EnrollResponse(
         user_id=user_id,
@@ -210,11 +227,11 @@ async def enroll(
 
 
 @app.post("/sessions", tags=["Authentication"])
-async def start_session(user_id: Annotated[str, Form()]):
-    """
-    Start a new authentication session for a user.
-    Returns a session_id to pass to subsequent /authenticate calls.
-    """
+async def start_session(
+    user_id: Annotated[str, Form()],
+    current_user: dict = Depends(get_current_user),
+):
+    """Start a new authentication session for a voice-enrolled user."""
     try:
         get_enrollment(user_id)
     except KeyError:
@@ -234,17 +251,9 @@ async def authenticate(
     file: Annotated[UploadFile, File()],
     enroll_file: Annotated[Optional[UploadFile], File()] = None,
     language: Annotated[Optional[str], Form()] = "default",
+    current_user: dict = Depends(get_current_user),
 ):
-    """
-    Authenticate one attempt within an existing session.
-
-    - **session_id**: from POST /sessions
-    - **file**: probe audio file
-    - **enroll_file**: optional — original enrollment audio for channel mismatch check
-    - **language**: spoken language (improves threshold adaptation)
-
-    Returns a decision: `accept`, `reject`, `retry`, or `step_up`.
-    """
+    """Authenticate one attempt within an existing session."""
     session = _session_manager.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
@@ -269,8 +278,7 @@ async def authenticate(
 
     logger.info(
         f"Auth attempt {session.total_attempts} for '{session.user_id}': "
-        f"{result.decision.value} (sv={result.speaker_score:.3f} "
-        f"spoof={result.spoof_score:.3f})"
+        f"{result.decision.value} (sv={result.speaker_score:.3f} spoof={result.spoof_score:.3f})"
     )
 
     return AuthResponse(
@@ -288,8 +296,26 @@ async def authenticate(
     )
 
 
+@app.get("/sessions", tags=["Authentication"])
+async def list_sessions(
+    current_user: dict = Depends(require_role("admin", "ops")),
+):
+    """List all active sessions. Requires admin or ops role."""
+    if not _session_manager:
+        return []
+    summaries = []
+    for session_id in list(_session_manager._sessions.keys()):
+        s = _session_manager.session_summary(session_id)
+        if s:
+            summaries.append(s)
+    return summaries
+
+
 @app.get("/sessions/{session_id}", response_model=SessionResponse, tags=["Authentication"])
-async def get_session(session_id: str):
+async def get_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """Retrieve attempt history and current status for a session."""
     summary = _session_manager.session_summary(session_id)
     if not summary:
@@ -316,16 +342,25 @@ async def get_session(session_id: str):
 
 @app.get("/users/{user_id}", response_model=UserStatusResponse, tags=["Enrollment"])
 async def get_user(user_id: str):
-    """Check whether a user is enrolled."""
+    """Check whether a voice user is enrolled — public."""
     enrolled = user_id in list_users()
     return UserStatusResponse(user_id=user_id, enrolled=enrolled)
 
 
+@app.get("/users", tags=["Enrollment"])
+async def get_all_users(current_user: dict = Depends(get_current_user)):
+    """List all enrolled voice users."""
+    return {"users": list_users()}
+
+
 @app.delete("/users/{user_id}", response_model=DeleteUserResponse, tags=["Enrollment"])
-async def remove_user(user_id: str):
-    """Delete a user's enrollment profile."""
+async def remove_user(
+    user_id: str,
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Delete a user's voice enrollment. Requires admin role."""
     if user_id not in list_users():
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found.")
     delete_user(user_id)
-    logger.info(f"Deleted enrollment for user '{user_id}'")
+    logger.info(f"Deleted enrollment for user '{user_id}' by admin '{current_user['username']}'")
     return DeleteUserResponse(user_id=user_id, deleted=True)
