@@ -88,10 +88,6 @@ export default function Login() {
         </form>
 
         <p className="text-muted text-sm" style={{ textAlign: 'center', marginTop: 20 }}>
-          Default credentials are set in <code>configs/api.yaml</code>
-        </p>
-
-        <p className="text-muted text-sm" style={{ textAlign: 'center', marginTop: 12 }}>
           Don't have an account?{' '}
           <a href="/signup" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 500 }}>
             Create one
