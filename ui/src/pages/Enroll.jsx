@@ -255,7 +255,7 @@ export default function Enroll() {
               >
                 <div className="drop-zone-icon">🎙</div>
                 <div className="drop-zone-text">Drop audio files here or click to browse</div>
-                <div className="drop-zone-sub">WAV · MP3 · FLAC · OGG  (16kHz recommended, ≥ 10s of speech)</div>
+                <div className="drop-zone-sub">WAV · FLAC · OGG · M4A · MP3  (16kHz recommended, ≥ 10s of speech)</div>
               </div>
               <input ref={inputRef} type="file" accept="audio/*" multiple style={{ display: 'none' }} onChange={e => addFiles(e.target.files)} />
 

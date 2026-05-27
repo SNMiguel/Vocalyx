@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -138,20 +140,65 @@ async def log_requests(request: Request, call_next):
 
 # ── audio loading helper ──────────────────────────────────────────────────────
 
+# Point pydub at the conda env's ffmpeg so it can decode m4a/mp3/etc.
+_FFMPEG = Path(sys.executable).parent / "ffmpeg.exe"
+if _FFMPEG.exists():
+    try:
+        from pydub import AudioSegment
+        AudioSegment.converter = str(_FFMPEG)
+        _PYDUB_AVAILABLE = True
+    except ImportError:
+        _PYDUB_AVAILABLE = False
+else:
+    _PYDUB_AVAILABLE = False
+
+
+def _decode_with_pydub(content: bytes, filename: str) -> tuple[np.ndarray, int]:
+    """Decode audio via pydub/ffmpeg — handles m4a, mp3, and any ffmpeg-supported format."""
+    from pydub import AudioSegment
+    suffix = Path(filename or "audio.m4a").suffix.lstrip(".") or "m4a"
+    audio = AudioSegment.from_file(io.BytesIO(content), format=suffix)
+    wav_io = io.BytesIO()
+    audio.export(wav_io, format="wav")
+    wav_io.seek(0)
+    data, sr = sf.read(wav_io, dtype="float32", always_2d=True)
+    return data, sr
+
+
 async def _load_uploaded_audio(file: UploadFile) -> torch.Tensor:
-    """Read an uploaded audio file and return a preprocessed (1, samples) tensor."""
+    """Read an uploaded audio file and return a preprocessed (1, samples) tensor.
+
+    Tries soundfile first (WAV/FLAC/OGG), then falls back to pydub/ffmpeg
+    for everything else (m4a, mp3, aac, …).
+    """
     content = await file.read()
     if len(content) > MAX_AUDIO_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Audio file exceeds {MAX_AUDIO_BYTES // (1024*1024)} MB limit.",
         )
+
+    data, sr = None, None
+
+    # Primary: soundfile (fast, no subprocess)
     try:
-        buffer = io.BytesIO(content)
-        data, sr = sf.read(buffer, dtype="float32", always_2d=True)
-        waveform = torch.from_numpy(data.T)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not decode audio file: {e}")
+        data, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=True)
+    except Exception:
+        pass
+
+    # Fallback: pydub/ffmpeg (handles m4a, mp3, aac, …)
+    if data is None:
+        if not _PYDUB_AVAILABLE:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Cannot decode '{file.filename}'. Supported formats: WAV, FLAC, OGG, M4A, MP3.",
+            )
+        try:
+            data, sr = _decode_with_pydub(content, file.filename or "")
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Could not decode audio file '{file.filename}': {e}")
+
+    waveform = torch.from_numpy(data.T)
 
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)

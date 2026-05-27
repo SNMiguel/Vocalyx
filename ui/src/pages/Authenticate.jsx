@@ -219,7 +219,7 @@ export default function Authenticate() {
                         <>
                           <div className="drop-zone-icon">🎙</div>
                           <div className="drop-zone-text">Drop probe audio or click to browse</div>
-                          <div className="drop-zone-sub">WAV · MP3 · FLAC</div>
+                          <div className="drop-zone-sub">WAV · FLAC · OGG · M4A · MP3</div>
                         </>
                       )}
                     </div>
