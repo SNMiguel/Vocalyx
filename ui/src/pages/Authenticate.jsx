@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { startSession, authenticate } from '../api'
 import DecisionCard from '../components/DecisionCard'
@@ -10,15 +10,103 @@ export default function Authenticate() {
 
   const [userId, setUserId] = useState(user?.username ?? '')
   const [sessionId, setSessionId] = useState(null)
+  const [challenge, setChallenge] = useState('')
+  const [expiresIn, setExpiresIn] = useState(0)
+  const [timeLeft, setTimeLeft] = useState(0)
   const [probeFile, setProbeFile] = useState(null)
-  const [probeMode, setProbeMode] = useState('record') // 'record' | 'upload'
-  const [dragging, setDragging] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const [step, setStep] = useState(1) // 1=start, 2=probe, 3=result
-  const fileRef = useRef()
+  const [step, setStep] = useState(1)
+
+  // Refs so timer callbacks always see latest values
+  const probeFileRef = useRef(null)
+  const sessionIdRef = useRef(null)
+  const recordingStopRef = useRef(null)
+  const displayTimerRef = useRef(null)
+  const expireTimerRef = useRef(null)
+
+  useEffect(() => { probeFileRef.current = probeFile }, [probeFile])
+  useEffect(() => { sessionIdRef.current = sessionId }, [sessionId])
+
   const { recording, elapsed, micError, micLevel, start, stop } = useAudioRecorder()
+
+  // Keep stop ref fresh for the expiry callback
+  useEffect(() => { recordingStopRef.current = stop }, [stop])
+
+  const submitFile = useCallback(async (file, sid) => {
+    if (!file || !sid) return
+    setError('')
+    setLoading(true)
+    try {
+      const res = await authenticate(sid, file, token)
+      setResult(res)
+    } catch (err) {
+      // Always show a decision card — never leave user stuck on the recording screen
+      setResult({
+        decision: 'reject',
+        speaker_score: 0,
+        spoof_score: 0,
+        explanation: err.message,
+      })
+    } finally {
+      setLoading(false)
+      setStep(3)
+    }
+  }, [token])
+
+  // Called when countdown hits zero
+  const handleExpired = useCallback(async () => {
+    clearInterval(displayTimerRef.current)
+    clearTimeout(expireTimerRef.current)
+
+    let file = probeFileRef.current
+    const sid = sessionIdRef.current
+
+    // If mid-recording, stop and collect the clip
+    if (recordingStopRef.current) {
+      const res = await recordingStopRef.current()
+      if (res) {
+        const { wavBlob, duration } = res
+        file = new File([wavBlob], `probe_${Date.now()}.wav`, { type: 'audio/wav' })
+        file._previewUrl = URL.createObjectURL(wavBlob)
+        file._duration = duration
+        setProbeFile(file)
+      }
+    }
+
+    if (file && sid) {
+      // Auto-submit whatever was recorded
+      await submitFile(file, sid)
+    } else {
+      setError('Session expired — no recording was made. Start a new session.')
+      setSessionId(null)
+      setChallenge('')
+      setProbeFile(null)
+      setStep(1)
+    }
+  }, [submitFile])
+
+  // Start countdown when entering step 2
+  useEffect(() => {
+    if (step !== 2 || !expiresIn) return
+
+    setTimeLeft(expiresIn)
+
+    displayTimerRef.current = setInterval(() => {
+      setTimeLeft(prev => Math.max(0, prev - 1))
+    }, 1000)
+
+    expireTimerRef.current = setTimeout(() => {
+      clearInterval(displayTimerRef.current)
+      handleExpired()
+    }, expiresIn * 1000)
+
+    return () => {
+      clearInterval(displayTimerRef.current)
+      clearTimeout(expireTimerRef.current)
+    }
+  }, [step, expiresIn, handleExpired])
 
   const handleStartSession = async () => {
     if (!userId.trim()) return setError('User ID is required.')
@@ -27,6 +115,10 @@ export default function Authenticate() {
     try {
       const res = await startSession(userId.trim(), token)
       setSessionId(res.session_id)
+      setChallenge(res.challenge)
+      setExpiresIn(res.expires_in ?? 10)
+      setProbeFile(null)
+      setResult(null)
       setStep(2)
     } catch (err) {
       setError(err.message)
@@ -36,22 +128,17 @@ export default function Authenticate() {
   }
 
   const handleAuthenticate = async () => {
-    if (!probeFile) return setError('Select a probe audio file.')
-    setError('')
-    setLoading(true)
-    try {
-      const res = await authenticate(sessionId, probeFile, token)
-      setResult(res)
-      setStep(3)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
+    if (!probeFile) return setError('Record your voice first.')
+    clearInterval(displayTimerRef.current)
+    clearTimeout(expireTimerRef.current)
+    await submitFile(probeFile, sessionId)
   }
 
   const reset = () => {
+    clearInterval(displayTimerRef.current)
+    clearTimeout(expireTimerRef.current)
     setSessionId(null)
+    setChallenge('')
     setProbeFile(null)
     setResult(null)
     setError('')
@@ -65,21 +152,17 @@ export default function Authenticate() {
     setStep(2)
   }
 
-  const setFile = (f) => {
-    if (f && (f.type.startsWith('audio/') || f.name.match(/\.(wav|mp3|flac|ogg|m4a)$/i))) {
-      setProbeFile(f)
-    }
-  }
-
   const handleStopRecording = async () => {
-    const result = await stop()
-    if (!result) return
-    const { wavBlob, duration } = result
+    const res = await stop()
+    if (!res) return
+    const { wavBlob, duration } = res
     const file = new File([wavBlob], `probe_${Date.now()}.wav`, { type: 'audio/wav' })
     file._previewUrl = URL.createObjectURL(wavBlob)
     file._duration = duration
     setProbeFile(file)
   }
+
+  const timerUrgent = timeLeft <= 5 && timeLeft > 0
 
   return (
     <>
@@ -91,7 +174,6 @@ export default function Authenticate() {
       </div>
 
       <div style={{ maxWidth: 560 }}>
-        {/* Step indicator */}
         <div className="step-indicator">
           <div className={`step ${step >= 1 ? (step > 1 ? 'done' : 'active') : ''}`}>
             <span className="step-num">{step > 1 ? '✓' : '1'}</span>
@@ -100,7 +182,7 @@ export default function Authenticate() {
           <div className="step-sep" />
           <div className={`step ${step >= 2 ? (step > 2 ? 'done' : 'active') : ''}`}>
             <span className="step-num">{step > 2 ? '✓' : '2'}</span>
-            <span>Probe audio</span>
+            <span>Record voice</span>
           </div>
           <div className="step-sep" />
           <div className={`step ${step >= 3 ? 'active' : ''}`}>
@@ -115,7 +197,7 @@ export default function Authenticate() {
           </div>
         )}
 
-        {/* Step 1: Start session */}
+        {/* Step 1 */}
         {step === 1 && (
           <div className="card">
             <div className="card-body">
@@ -137,112 +219,102 @@ export default function Authenticate() {
           </div>
         )}
 
-        {/* Step 2: Probe audio */}
+        {/* Step 2 */}
         {step === 2 && (
           <div className="card">
             <div className="card-body">
-              <div className="alert alert-info" style={{ marginBottom: 16 }}>
-                <span>ℹ</span> Session started for <strong>{userId}</strong>
-                <span className="font-mono" style={{ marginLeft: 8, fontSize: '0.75rem', opacity: 0.7 }}>
-                  {sessionId?.slice(0, 8)}…
-                </span>
-              </div>
 
-              <div className="form-group">
-                <label className="form-label">Probe audio</label>
-
-                {/* Mode tabs */}
-                <div className="tab-bar" style={{ marginBottom: 12 }}>
-                  <button className={`tab-btn${probeMode === 'record' ? ' active' : ''}`} onClick={() => { setProbeMode('record'); setProbeFile(null) }}>
-                    🎙 Record
-                  </button>
-                  <button className={`tab-btn${probeMode === 'upload' ? ' active' : ''}`} onClick={() => { setProbeMode('upload'); setProbeFile(null) }}>
-                    📁 Upload
-                  </button>
+              {/* Challenge phrase */}
+              <div style={{ marginBottom: 16, padding: '16px', background: 'var(--accent)', borderRadius: 10 }}>
+                <div style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.75)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.08em', fontWeight: 600 }}>
+                  Say this phrase aloud while recording
                 </div>
+                <div style={{ fontSize: '1.45rem', fontWeight: 700, letterSpacing: '0.03em', color: '#ffffff', lineHeight: 1.35 }}>
+                  {challenge}
+                </div>
+              </div>
 
-                {probeMode === 'record' ? (
-                  <div>
-                    {micError && <div className="alert alert-error" style={{ marginBottom: 8 }}>⚠ {micError}</div>}
-                    <div className="record-zone" style={{ marginBottom: 12 }}>
-                      <button
-                        className={`record-btn${recording ? ' recording' : ''}`}
-                        onClick={recording ? handleStopRecording : start}
-                        title={recording ? 'Stop' : 'Start recording'}
-                      >
-                        {recording ? '⏹' : '●'}
-                      </button>
-                      {recording && (
-                        <div className="mic-level-bar">
-                          {Array.from({ length: 12 }).map((_, i) => (
-                            <div
-                              key={i}
-                              className="mic-level-seg"
-                              style={{
-                                opacity: micLevel > (i / 12) * 100 ? 1 : 0.15,
-                                background: i < 8 ? 'var(--accept)' : 'var(--retry)',
-                              }}
-                            />
-                          ))}
-                        </div>
-                      )}
-                      <div className="record-label">
-                        {recording
-                          ? <span className="record-live">Recording… {elapsed.toFixed(1)}s</span>
-                          : probeFile
-                            ? <span className="text-muted">Recording ready — re-record to replace</span>
-                            : <span className="text-muted">Say a few sentences in your natural voice</span>
-                        }
-                      </div>
-                    </div>
-                    {probeFile?._previewUrl && (
-                      <audio src={probeFile._previewUrl} controls style={{ width: '100%', marginTop: 4 }} />
-                    )}
+              {/* Countdown bar — hidden once submitted */}
+              {!loading && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+                  <div style={{
+                    fontSize: '0.85rem', fontWeight: 600, minWidth: 120,
+                    color: timerUrgent ? 'var(--reject, #f38ba8)' : 'var(--text-muted)',
+                    fontVariantNumeric: 'tabular-nums', transition: 'color 0.3s',
+                  }}>
+                    {timerUrgent ? '⚠ ' : ''}{timeLeft}s remaining
                   </div>
-                ) : (
-                  <div>
-                    <div
-                      className={`drop-zone${dragging ? ' dragging' : ''}`}
-                      onClick={() => fileRef.current.click()}
-                      onDragOver={e => { e.preventDefault(); setDragging(true) }}
-                      onDragLeave={() => setDragging(false)}
-                      onDrop={e => { e.preventDefault(); setDragging(false); setFile(e.dataTransfer.files[0]) }}
-                      style={{ padding: '24px' }}
+                  <div style={{ flex: 1, height: 4, background: 'var(--border)', borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{
+                      height: '100%',
+                      width: `${(timeLeft / expiresIn) * 100}%`,
+                      background: timerUrgent ? 'var(--reject, #f38ba8)' : 'var(--accent)',
+                      transition: 'width 1s linear, background 0.3s',
+                      borderRadius: 2,
+                    }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Recording controls — locked once loading or time is up */}
+              {loading ? (
+                <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--text-muted)' }}>
+                  <div style={{ fontSize: '1.5rem', marginBottom: 8 }}>⏳</div>
+                  <div style={{ fontWeight: 600 }}>Verifying your voice…</div>
+                  <div style={{ fontSize: '0.85rem', marginTop: 4 }}>Please wait</div>
+                </div>
+              ) : (
+                <div className="form-group">
+                  <label className="form-label">Record yourself saying the phrase above</label>
+                  {micError && <div className="alert alert-error" style={{ marginBottom: 8 }}>⚠ {micError}</div>}
+                  <div className="record-zone" style={{ marginBottom: 12 }}>
+                    <button
+                      className={`record-btn${recording ? ' recording' : ''}`}
+                      onClick={recording ? handleStopRecording : start}
+                      disabled={timeLeft === 0}
+                      title={recording ? 'Stop' : 'Start recording'}
                     >
-                      {probeFile ? (
-                        <>
-                          <div className="drop-zone-icon">🎵</div>
-                          <div className="drop-zone-text">{probeFile.name}</div>
-                          <div className="drop-zone-sub">Click to change</div>
-                        </>
-                      ) : (
-                        <>
-                          <div className="drop-zone-icon">🎙</div>
-                          <div className="drop-zone-text">Drop probe audio or click to browse</div>
-                          <div className="drop-zone-sub">WAV · FLAC · OGG · M4A · MP3</div>
-                        </>
-                      )}
+                      {recording ? '⏹' : '●'}
+                    </button>
+                    {recording && (
+                      <div className="mic-level-bar">
+                        {Array.from({ length: 12 }).map((_, i) => (
+                          <div key={i} className="mic-level-seg" style={{
+                            opacity: micLevel > (i / 12) * 100 ? 1 : 0.15,
+                            background: i < 8 ? 'var(--accept)' : 'var(--retry)',
+                          }} />
+                        ))}
+                      </div>
+                    )}
+                    <div className="record-label">
+                      {recording
+                        ? <span className="record-live">Recording… {elapsed.toFixed(1)}s</span>
+                        : probeFile
+                          ? <span className="text-muted">Recording ready — submit or re-record</span>
+                          : <span className="text-muted">Press ● then speak the phrase clearly</span>
+                      }
                     </div>
-                    <input ref={fileRef} type="file" accept="audio/*" style={{ display: 'none' }} onChange={e => setFile(e.target.files[0])} />
                   </div>
-                )}
-              </div>
+                  {probeFile?._previewUrl && (
+                    <audio src={probeFile._previewUrl} controls style={{ width: '100%', marginTop: 4 }} />
+                  )}
+                  <div className="flex gap-2" style={{ marginTop: 8 }}>
+                    <button className="btn btn-primary btn-lg" onClick={handleAuthenticate} disabled={!probeFile || timeLeft === 0}>
+                      Verify voice
+                    </button>
+                    <button className="btn btn-secondary" onClick={reset}>Cancel</button>
+                  </div>
+                </div>
+              )}
 
-              <div className="flex gap-2">
-                <button className="btn btn-primary btn-lg" onClick={handleAuthenticate} disabled={loading || !probeFile}>
-                  {loading ? 'Verifying…' : 'Verify voice'}
-                </button>
-                <button className="btn btn-secondary" onClick={reset}>Cancel</button>
-              </div>
             </div>
           </div>
         )}
 
-        {/* Step 3: Result */}
+        {/* Step 3 */}
         {step === 3 && result && (
           <div>
             <DecisionCard result={result} />
-
             <div className="flex gap-2 mt-4">
               {(result.decision === 'retry' || result.decision === 'step_up') && (
                 <button className="btn btn-primary" onClick={tryAgain}>Try again</button>

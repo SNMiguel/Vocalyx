@@ -1,23 +1,41 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { listSessions } from '../api'
 
-const decisionBadge = (d) => `badge badge-${d}`
-const statusBadge = (s) => `badge badge-${s}`
+const REFRESH_INTERVAL = 30 // seconds
 
-function AttemptList({ attempts }) {
-  if (!attempts?.length) return <p className="text-muted text-sm" style={{ padding: '8px 16px 8px 40px' }}>No attempts recorded.</p>
+function timeAgo(ts) {
+  if (!ts) return '—'
+  const diff = Date.now() / 1000 - ts
+  if (diff < 60) return 'just now'
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
+  return `${Math.floor(diff / 86400)}d ago`
+}
+
+function AttemptList({ attempts, challenge }) {
   return (
-    <div className="attempt-list">
-      {attempts.map(a => (
-        <div key={a.attempt} className="attempt-item">
-          <span className="attempt-num">#{a.attempt}</span>
-          <span className={decisionBadge(a.decision)}>{a.decision}</span>
-          <span className="text-sm">SV: {(a.speaker_score * 100).toFixed(0)}%</span>
-          <span className="text-sm">Spoof: {(a.spoof_score * 100).toFixed(0)}%</span>
-          <span className="attempt-expl">{a.explanation}</span>
+    <div style={{ padding: '8px 16px 12px 40px' }}>
+      {challenge && (
+        <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 600 }}>Challenge</span>
+          <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--accent)' }}>{challenge}</span>
         </div>
-      ))}
+      )}
+      {!attempts?.length
+        ? <p className="text-muted text-sm">No attempts recorded.</p>
+        : <div className="attempt-list">
+            {attempts.map(a => (
+              <div key={a.attempt} className="attempt-item">
+                <span className="attempt-num">#{a.attempt}</span>
+                <span className={`badge badge-${a.decision}`}>{a.decision}</span>
+                <span className="text-sm">SV: {(a.speaker_score * 100).toFixed(0)}%</span>
+                <span className="text-sm">Spoof: {(a.spoof_score * 100).toFixed(0)}%</span>
+                <span className="attempt-expl">{a.explanation}</span>
+              </div>
+            ))}
+          </div>
+      }
     </div>
   )
 }
@@ -29,13 +47,38 @@ export default function Sessions() {
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [lastUpdated, setLastUpdated] = useState(null)
+  const [secondsSince, setSecondsSince] = useState(0)
+  const intervalRef = useRef(null)
+  const tickRef = useRef(null)
 
-  useEffect(() => {
+  const refresh = useCallback((silent = false) => {
+    if (!silent) setLoading(true)
     listSessions(token)
-      .then(setSessions)
+      .then(data => {
+        setSessions(data)
+        setLastUpdated(Date.now())
+        setSecondsSince(0)
+        setError('')
+      })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
   }, [token])
+
+  // Initial load + auto-refresh every 30s
+  useEffect(() => {
+    refresh()
+    intervalRef.current = setInterval(() => refresh(true), REFRESH_INTERVAL * 1000)
+    return () => clearInterval(intervalRef.current)
+  }, [refresh])
+
+  // Tick counter for "last updated Xs ago"
+  useEffect(() => {
+    tickRef.current = setInterval(() => {
+      setSecondsSince(prev => prev + 1)
+    }, 1000)
+    return () => clearInterval(tickRef.current)
+  }, [])
 
   const toggle = (id) => setExpanded(prev => {
     const next = new Set(prev)
@@ -43,9 +86,9 @@ export default function Sessions() {
     return next
   })
 
-  const filtered = sessions.filter(s =>
-    !filter || s.user_id.toLowerCase().includes(filter.toLowerCase())
-  )
+  const filtered = [...sessions]
+    .sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0))
+    .filter(s => !filter || s.user_id.toLowerCase().includes(filter.toLowerCase()))
 
   return (
     <>
@@ -54,12 +97,14 @@ export default function Sessions() {
           <h1 className="page-title">Sessions</h1>
           <p className="page-subtitle">Auth attempt history for all enrolled users.</p>
         </div>
-        <button className="btn btn-secondary" onClick={() => {
-          setLoading(true)
-          listSessions(token).then(setSessions).finally(() => setLoading(false))
-        }}>
-          ↺ Refresh
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {lastUpdated && (
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+              Updated {secondsSince}s ago · auto-refreshes every {REFRESH_INTERVAL}s
+            </span>
+          )}
+          <button className="btn btn-secondary" onClick={() => refresh()}>↺ Refresh</button>
+        </div>
       </div>
 
       {error && <div className="alert alert-error">⚠ {error}</div>}
@@ -92,12 +137,13 @@ export default function Sessions() {
               <thead>
                 <tr>
                   <th />
-                  <th>Session ID</th>
                   <th>User</th>
                   <th>Status</th>
                   <th>Attempts</th>
                   <th>Retries</th>
                   <th>Locked</th>
+                  <th>Started</th>
+                  <th>Completed</th>
                 </tr>
               </thead>
               <tbody>
@@ -109,17 +155,18 @@ export default function Sessions() {
                           {expanded.has(s.session_id) ? '▾' : '▸'}
                         </button>
                       </td>
-                      <td><span className="font-mono truncate">{s.session_id}</span></td>
                       <td><strong>{s.user_id}</strong></td>
-                      <td><span className={statusBadge(s.status)}>{s.status}</span></td>
+                      <td><span className={`badge badge-${s.status}`}>{s.status}</span></td>
                       <td>{s.total_attempts}</td>
                       <td>{s.retry_count}</td>
                       <td>{s.is_locked ? '🔒 Yes' : '—'}</td>
+                      <td style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{timeAgo(s.created_at)}</td>
+                      <td style={{ color: 'var(--text-muted)', fontSize: '0.82rem' }}>{s.completed_at ? timeAgo(s.completed_at) : <span style={{ color: 'var(--accent)' }}>active</span>}</td>
                     </tr>
                     {expanded.has(s.session_id) && (
                       <tr key={`${s.session_id}-exp`} className="attempt-row">
-                        <td colSpan={7} style={{ padding: 0 }}>
-                          <AttemptList attempts={s.attempts} />
+                        <td colSpan={8} style={{ padding: 0 }}>
+                          <AttemptList attempts={s.attempts} challenge={s.challenge} />
                         </td>
                       </tr>
                     )}

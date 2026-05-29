@@ -43,6 +43,7 @@ export default function Layout({ children }) {
 
       <div className="body">
         <aside className="sidebar">
+          <SidebarLink to="/" icon="◼" label="Dashboard" />
           <span className="sidebar-section">Voice Auth</span>
           <SidebarLink to="/authenticate" icon="🔐" label="Authenticate" />
           <SidebarLink to="/enroll" icon="🎤" label="Enroll" />
@@ -59,6 +60,7 @@ export default function Layout({ children }) {
               <span className="sidebar-section">Admin</span>
               <SidebarLink to="/users" icon="👤" label="Voice Users" />
               <SidebarLink to="/app-users" icon="🔑" label="App Users" />
+              <SidebarLink to="/audit" icon="📜" label="Audit Log" />
             </>
           )}
         </aside>

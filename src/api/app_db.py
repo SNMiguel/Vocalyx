@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import binascii
 import hashlib
+import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 DB_PATH = Path("data/app.db")
@@ -53,6 +55,20 @@ def init_db(admin_username: str, admin_password: str) -> None:
                 username      TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 role          TEXT NOT NULL DEFAULT 'user'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions_log (
+                session_id     TEXT PRIMARY KEY,
+                user_id        TEXT NOT NULL,
+                status         TEXT NOT NULL,
+                challenge      TEXT,
+                created_at     REAL,
+                completed_at   REAL,
+                total_attempts INTEGER DEFAULT 0,
+                retry_count    INTEGER DEFAULT 0,
+                is_locked      INTEGER DEFAULT 0,
+                attempts_json  TEXT DEFAULT '[]'
             )
         """)
         row = conn.execute(
@@ -123,3 +139,93 @@ def delete_app_user(username: str) -> None:
         )
         if cur.rowcount == 0:
             raise ValueError(f"User '{username}' not found.")
+
+
+# ── session log ───────────────────────────────────────────────────────────────
+
+# ── audit log ─────────────────────────────────────────────────────────────────
+
+def init_audit_log() -> None:
+    """Create audit_log table if not exists. Called at server startup."""
+    with _conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                actor     TEXT NOT NULL,
+                action    TEXT NOT NULL,
+                target    TEXT,
+                details   TEXT
+            )
+        """)
+
+
+def log_audit(actor: str, action: str, target: str = None, details: str = None) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, actor, action, target, details) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), actor, action, target, details),
+        )
+
+
+def list_audit_logs(limit: int = 500) -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, timestamp, actor, action, target, details FROM audit_log ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [{"id": r["id"], "timestamp": r["timestamp"], "actor": r["actor"],
+             "action": r["action"], "target": r["target"], "details": r["details"]}
+            for r in rows]
+
+
+def log_session(summary: dict) -> None:
+    """Persist a completed session summary to SQLite. Upserts on session_id."""
+    with _conn() as conn:
+        conn.execute("""
+            INSERT INTO sessions_log
+                (session_id, user_id, status, challenge, created_at, completed_at,
+                 total_attempts, retry_count, is_locked, attempts_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                status         = excluded.status,
+                completed_at   = excluded.completed_at,
+                total_attempts = excluded.total_attempts,
+                retry_count    = excluded.retry_count,
+                is_locked      = excluded.is_locked,
+                attempts_json  = excluded.attempts_json
+        """, (
+            summary["session_id"],
+            summary["user_id"],
+            summary["status"],
+            summary.get("challenge"),
+            summary.get("created_at"),
+            time.time(),
+            summary.get("total_attempts", 0),
+            summary.get("retry_count", 0),
+            1 if summary.get("is_locked") else 0,
+            json.dumps(summary.get("attempts", [])),
+        ))
+
+
+def list_session_logs() -> list[dict]:
+    """Return all logged sessions, newest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sessions_log ORDER BY created_at DESC"
+        ).fetchall()
+    result = []
+    for r in rows:
+        result.append({
+            "session_id":     r["session_id"],
+            "user_id":        r["user_id"],
+            "status":         r["status"],
+            "challenge":      r["challenge"],
+            "created_at":     r["created_at"],
+            "completed_at":   r["completed_at"],
+            "total_attempts": r["total_attempts"],
+            "retry_count":    r["retry_count"],
+            "is_locked":      bool(r["is_locked"]),
+            "attempts":       json.loads(r["attempts_json"] or "[]"),
+        })
+    return result

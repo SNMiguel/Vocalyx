@@ -17,11 +17,25 @@ production this state would live in Redis or a sessions table.
 
 from __future__ import annotations
 
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+
+_CHALLENGE_WORDS = [
+    "apple", "bridge", "cloud", "dancer", "eagle", "falcon", "garden",
+    "harbor", "island", "jungle", "kernel", "lantern", "marble", "needle",
+    "orange", "pencil", "quartz", "ribbon", "silver", "tunnel", "umbrella",
+    "valley", "walnut", "yellow", "anchor", "basket", "candle", "diamond",
+    "forest", "glacier", "hammer", "iron", "jasper", "lemon", "mirror",
+    "north", "ocean", "pepper", "river", "shadow", "tiger", "violet",
+    "window", "xray", "zebra", "copper", "dagger", "ember", "feather",
+]
+
+def _generate_challenge() -> str:
+    return " ".join(random.sample(_CHALLENGE_WORDS, 4))
 
 import torch
 
@@ -51,7 +65,7 @@ class AttemptRecord:
 class SessionConfig:
     max_attempts: int = 4              # lock out after this many non-accept attempts
     step_up_after: int = 2             # escalate to STEP_UP after N retries
-    session_timeout_seconds: float = 300.0   # 5-minute session window
+    session_timeout_seconds: float = 30.0    # server-side window (client enforces 10s UI countdown + processing buffer)
     lockout_duration_seconds: float = 600.0  # 10-minute lockout
 
 
@@ -60,6 +74,7 @@ class Session:
     session_id: str
     user_id: str
     status: SessionStatus
+    challenge: str = field(default_factory=_generate_challenge)
     attempts: list[AttemptRecord] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     locked_at: Optional[float] = None
@@ -249,6 +264,8 @@ class SessionManager:
             "total_attempts": session.total_attempts,
             "retry_count": session.retry_count,
             "is_locked": session.is_locked,
+            "created_at": session.created_at,
+            "challenge": session.challenge,
             "attempts": [
                 {
                     "attempt": a.attempt_number,

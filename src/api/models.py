@@ -73,6 +73,8 @@ class SessionResponse(BaseModel):
     total_attempts: int
     retry_count: int
     is_locked: bool
+    created_at: Optional[float] = None
+    challenge: Optional[str] = None
     attempts: list[AttemptSummary]
 
 

@@ -78,6 +78,10 @@ export const listSessions = (token) => request('/sessions', {}, token)
 export const getSession = (sessionId, token) =>
   request(`/sessions/${encodeURIComponent(sessionId)}`, {}, token)
 
+// Audit log (admin only)
+export const getAuditLog = (token, limit = 500) =>
+  request(`/audit?limit=${limit}`, {}, token)
+
 // Authenticate
 export const authenticate = (sessionId, audioFile, token) => {
   const fd = new FormData()

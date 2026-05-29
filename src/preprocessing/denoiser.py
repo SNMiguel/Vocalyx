@@ -21,16 +21,16 @@ _available = False
 
 
 def load_model() -> bool:
-    """Check that noisereduce is importable. Called at server startup."""
+    """Check that noisereduce is importable. Called at server startup.
+
+    Disabled: noisereduce calls scipy FFT which triggers a BLAS DLL conflict
+    in this conda environment, crashing the server process on Windows.
+    Re-enable once the conda environment DLL conflict is resolved.
+    """
     global _available
-    try:
-        import noisereduce  # noqa: F401
-        _available = True
-        logger.info("noisereduce ready — noise suppression active.")
-        return True
-    except ImportError:
-        logger.warning("noisereduce not installed; noise suppression disabled.")
-        return False
+    _available = False
+    logger.info("noisereduce disabled (conda DLL conflict on Windows); skipping noise suppression.")
+    return False
 
 
 def denoise(waveform: torch.Tensor, sr: int) -> torch.Tensor:

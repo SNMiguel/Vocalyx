@@ -1,6 +1,6 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useAuth } from '../contexts/AuthContext'
-import { enrollUser } from '../api'
+import { enrollUser, getUserStatus } from '../api'
 import { useAudioRecorder } from '../hooks/useAudioRecorder'
 
 const MIN_SECONDS = 15  // guide shown to user (backend needs 10s after VAD)
@@ -27,6 +27,22 @@ export default function Enroll() {
 
   const [mode, setMode] = useState('record')
   const [userId, setUserId] = useState(isAdmin ? '' : user?.username ?? '')
+
+  // Enrollment status check
+  const [enrolledStatus, setEnrolledStatus] = useState(null) // null=unknown, true/false
+  const debounceRef = useRef(null)
+
+  useEffect(() => {
+    const uid = userId.trim()
+    if (!uid) { setEnrolledStatus(null); return }
+    clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => {
+      getUserStatus(uid)
+        .then(res => setEnrolledStatus(res.enrolled))
+        .catch(() => setEnrolledStatus(null))
+    }, isAdmin ? 500 : 0)
+    return () => clearTimeout(debounceRef.current)
+  }, [userId, isAdmin])
 
   // Upload state
   const [files, setFiles] = useState([])
@@ -91,6 +107,7 @@ export default function Enroll() {
     try {
       const res = await enrollUser(userId.trim(), submitFiles, token)
       setStatus({ type: 'success', msg: res.message })
+      setEnrolledStatus(true)
       setFiles([])
       clips.forEach(c => URL.revokeObjectURL(c.url))
       setClips([])
@@ -135,6 +152,30 @@ export default function Enroll() {
               <p className="text-sm text-muted" style={{ marginTop: 4 }}>
                 You can only enroll your own account.
               </p>
+            )}
+            {enrolledStatus === true && (
+              <div style={{
+                marginTop: 8, padding: '8px 12px', borderRadius: 8,
+                background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)',
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{ fontSize: '1rem' }}>⚠</span>
+                <span style={{ fontSize: '0.85rem', color: 'var(--retry, #f59e0b)', fontWeight: 500 }}>
+                  Already enrolled — submitting will overwrite the existing voice profile.
+                </span>
+              </div>
+            )}
+            {enrolledStatus === false && userId.trim() && (
+              <div style={{
+                marginTop: 8, padding: '8px 12px', borderRadius: 8,
+                background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.25)',
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{ fontSize: '1rem' }}>✓</span>
+                <span style={{ fontSize: '0.85rem', color: 'var(--accept, #10b981)', fontWeight: 500 }}>
+                  Not yet enrolled — a new voice profile will be created.
+                </span>
+              </div>
             )}
           </div>
 

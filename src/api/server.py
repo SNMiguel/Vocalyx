@@ -42,7 +42,14 @@ from src.api.models import (
 )
 from src.api.auth_router import router as auth_router, get_current_user, require_role
 import src.api.auth_router as _auth_mod
-from src.api.app_db import init_db
+from src.api.app_db import (
+    init_db,
+    log_session as _log_session,
+    list_session_logs as _list_session_logs,
+    init_audit_log as _init_audit_log,
+    log_audit as _log_audit,
+    list_audit_logs as _list_audit_logs,
+)
 from src.decision.fusion_layer import DecisionConfig, make_auth_decision
 from src.decision.session import SessionManager, SessionConfig
 from src.enrollment.embedder import get_embedding
@@ -64,10 +71,27 @@ logging.basicConfig(
 
 _session_manager: SessionManager | None = None
 _decision_config: DecisionConfig | None = None
+_whisper_model = None
 
 TARGET_SR = 16000
 MAX_AUDIO_BYTES = 50 * 1024 * 1024   # 50 MB
 MIN_ENROLL_SPEECH_SECONDS = 10.0     # minimum total speech time after VAD
+
+# ── rate limiting (in-memory, per IP) ────────────────────────────────────────
+
+from collections import defaultdict as _defaultdict
+_rate_buckets: dict[str, list[float]] = _defaultdict(list)
+_RATE_WINDOW  = 60.0   # seconds
+_RATE_MAX     = 10     # max session starts per IP per window
+
+def _is_rate_limited(ip: str) -> bool:
+    now = time.time()
+    bucket = [t for t in _rate_buckets[ip] if now - t < _RATE_WINDOW]
+    _rate_buckets[ip] = bucket
+    if len(bucket) >= _RATE_MAX:
+        return True
+    _rate_buckets[ip].append(now)
+    return False
 
 
 @asynccontextmanager
@@ -92,6 +116,7 @@ async def lifespan(app: FastAPI):
         admin_username=auth_cfg.get("admin_username", "admin"),
         admin_password=auth_cfg.get("admin_password", "admin123"),
     )
+    _init_audit_log()
 
     _decision_config = DecisionConfig()
     _session_manager = SessionManager(
@@ -100,6 +125,19 @@ async def lifespan(app: FastAPI):
     )
 
     load_denoiser()
+
+    # Load HuBERT anti-spoof model (replaces handcrafted spectral detector)
+    from src.antispoofing.deepfake_detector import load_hf_model as _load_antispoof
+    _load_antispoof("motheecreator/Deepfake-audio-detection")
+
+    # Load Whisper for challenge-response verification
+    global _whisper_model
+    try:
+        import whisper as _whisper
+        _whisper_model = _whisper.load_model("base")
+        logger.info("Whisper base loaded — challenge verification active.")
+    except Exception as e:
+        logger.warning(f"Whisper unavailable ({e}) — challenge verification disabled.")
 
     logger.info("Service ready.")
     yield
@@ -140,29 +178,42 @@ async def log_requests(request: Request, call_next):
 
 # ── audio loading helper ──────────────────────────────────────────────────────
 
-# Point pydub at the conda env's ffmpeg so it can decode m4a/mp3/etc.
-_FFMPEG = Path(sys.executable).parent / "ffmpeg.exe"
-if _FFMPEG.exists():
+# Use imageio-ffmpeg's bundled binary — avoids conda DLL conflicts entirely.
+try:
+    import imageio_ffmpeg as _iio_ffmpeg
+    _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
+    _AV_AVAILABLE = True
+    logger.info(f"imageio-ffmpeg ready: {_FFMPEG_EXE}")
+except Exception:
+    _FFMPEG_EXE = None
+    _AV_AVAILABLE = False
+    logger.warning("imageio-ffmpeg not available — m4a/mp3 decoding unavailable.")
+
+
+def _decode_with_ffmpeg(content: bytes, filename: str) -> tuple[np.ndarray, int]:
+    """Decode audio via imageio-ffmpeg's bundled binary — outputs raw PCM, no soundfile."""
+    import subprocess, tempfile
+    suffix = Path(filename or "audio.m4a").suffix or ".m4a"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
     try:
-        from pydub import AudioSegment
-        AudioSegment.converter = str(_FFMPEG)
-        _PYDUB_AVAILABLE = True
-    except ImportError:
-        _PYDUB_AVAILABLE = False
-else:
-    _PYDUB_AVAILABLE = False
-
-
-def _decode_with_pydub(content: bytes, filename: str) -> tuple[np.ndarray, int]:
-    """Decode audio via pydub/ffmpeg — handles m4a, mp3, and any ffmpeg-supported format."""
-    from pydub import AudioSegment
-    suffix = Path(filename or "audio.m4a").suffix.lstrip(".") or "m4a"
-    audio = AudioSegment.from_file(io.BytesIO(content), format=suffix)
-    wav_io = io.BytesIO()
-    audio.export(wav_io, format="wav")
-    wav_io.seek(0)
-    data, sr = sf.read(wav_io, dtype="float32", always_2d=True)
-    return data, sr
+        # Output raw float32 mono PCM at TARGET_SR — numpy reads it directly, no soundfile needed.
+        result = subprocess.run(
+            [_FFMPEG_EXE, "-y", "-i", str(tmp_path),
+             "-f", "f32le", "-ar", str(TARGET_SR), "-ac", "1", "pipe:1"],
+            capture_output=True,
+            check=True,
+        )
+        if not result.stdout:
+            raise RuntimeError("ffmpeg produced no output")
+        audio = np.frombuffer(result.stdout, dtype=np.float32).copy()
+        # Return (samples, 1) to match soundfile's always_2d=True output format
+        return audio[:, np.newaxis], TARGET_SR
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(e.stderr.decode(errors="replace"))
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 async def _load_uploaded_audio(file: UploadFile) -> torch.Tensor:
@@ -180,21 +231,25 @@ async def _load_uploaded_audio(file: UploadFile) -> torch.Tensor:
 
     data, sr = None, None
 
-    # Primary: soundfile (fast, no subprocess)
-    try:
-        data, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=True)
-    except Exception:
-        pass
+    # soundfile handles WAV/FLAC/OGG natively; skip it for formats it can't decode
+    # (libsndfile segfaults on m4a/mp3 rather than raising a Python exception)
+    _ext = Path(file.filename or "").suffix.lower()
+    _soundfile_formats = {".wav", ".flac", ".ogg", ".aiff", ".aif", ".au", ".snd"}
+    if _ext in _soundfile_formats or _ext == "":
+        try:
+            data, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=True)
+        except Exception:
+            pass
 
-    # Fallback: pydub/ffmpeg (handles m4a, mp3, aac, …)
+    # Fallback: ffmpeg subprocess (handles m4a, mp3, aac, …)
     if data is None:
-        if not _PYDUB_AVAILABLE:
+        if not _AV_AVAILABLE:
             raise HTTPException(
                 status_code=422,
                 detail=f"Cannot decode '{file.filename}'. Supported formats: WAV, FLAC, OGG, M4A, MP3.",
             )
         try:
-            data, sr = _decode_with_pydub(content, file.filename or "")
+            data, sr = _decode_with_ffmpeg(content, file.filename or "")
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"Could not decode audio file '{file.filename}': {e}")
 
@@ -203,8 +258,6 @@ async def _load_uploaded_audio(file: UploadFile) -> torch.Tensor:
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
-    # Denoise at original sample rate — DeepFilterNet handles internal 48kHz conversion.
-    # Applied before resampling to avoid double-resampling artifacts.
     waveform = denoise(waveform, sr)
 
     if sr != TARGET_SR:
@@ -213,6 +266,40 @@ async def _load_uploaded_audio(file: UploadFile) -> torch.Tensor:
     waveform = rms_normalize(waveform)
     waveform = apply_vad_energy(waveform)
     return waveform
+
+
+def _transcribe_and_verify(waveform: torch.Tensor, challenge: str) -> tuple[bool, str]:
+    """Transcribe probe audio with Whisper and verify all challenge words were spoken."""
+    import re
+    from difflib import SequenceMatcher
+
+    if _whisper_model is None or not challenge:
+        return True, ""
+    try:
+        audio_np = waveform.squeeze(0).numpy()
+        # initial_prompt biases the decoder toward the expected words — large accuracy boost
+        result = _whisper_model.transcribe(
+            audio_np, language="en", fp16=False,
+            initial_prompt=f"The speaker will say these words: {challenge}",
+        )
+        transcription = result["text"].lower()
+        trans_words = re.sub(r"[^a-z\s]", "", transcription).split()
+        challenge_words = challenge.lower().split()
+
+        missing = []
+        for cw in challenge_words:
+            # fuzzy match: accept if any transcribed word is ≥80% similar
+            found = any(SequenceMatcher(None, cw, tw).ratio() >= 0.80 for tw in trans_words)
+            if not found:
+                missing.append(cw)
+
+        logger.info(f"Challenge: '{challenge}' | heard: '{transcription}' | missing={missing or 'none'}")
+        if missing:
+            return False, f"Did not hear: {', '.join(missing)}"
+        return True, transcription
+    except Exception as e:
+        logger.warning(f"Whisper transcription failed ({e}) — skipping challenge check.")
+        return True, ""
 
 
 def _spoof_detail(fusion_result) -> SpoofDetail:
@@ -288,6 +375,7 @@ async def enroll(
 
     enroll_user(user_id, embeddings)
     logger.info(f"Enrolled user '{user_id}' with {len(embeddings)} sample(s) by '{current_user['username']}'.")
+    _log_audit(current_user["username"], "enroll", user_id, f"samples={len(embeddings)}")
 
     return EnrollResponse(
         user_id=user_id,
@@ -299,10 +387,17 @@ async def enroll(
 
 @app.post("/sessions", tags=["Authentication"])
 async def start_session(
+    request: Request,
     user_id: Annotated[str, Form()],
     current_user: dict = Depends(get_current_user),
 ):
     """Start a new authentication session for a voice-enrolled user."""
+    client_ip = request.client.host if request.client else "unknown"
+    if _is_rate_limited(client_ip):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many session requests. Please wait before trying again.",
+        )
     try:
         get_enrollment(user_id)
     except KeyError:
@@ -312,8 +407,13 @@ async def start_session(
         )
 
     session = _session_manager.start_session(user_id)
-    logger.info(f"Session started: {session.session_id} for user '{user_id}'")
-    return {"session_id": session.session_id, "user_id": user_id}
+    logger.info(f"Session started: {session.session_id} for user '{user_id}' challenge='{session.challenge}'")
+    return {
+        "session_id": session.session_id,
+        "user_id": user_id,
+        "challenge": session.challenge,
+        "expires_in": int(session.config.session_timeout_seconds),
+    }
 
 
 @app.post("/authenticate", response_model=AuthResponse, tags=["Authentication"])
@@ -325,6 +425,7 @@ async def authenticate(
     current_user: dict = Depends(get_current_user),
 ):
     """Authenticate one attempt within an existing session."""
+    import traceback
     session = _session_manager.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
@@ -332,12 +433,25 @@ async def authenticate(
     if session.is_locked:
         raise HTTPException(status_code=403, detail="Session is locked. Start a new session.")
 
-    probe_waveform = await _load_uploaded_audio(file)
-    enroll_waveform = None
-    if enroll_file:
-        enroll_waveform = await _load_uploaded_audio(enroll_file)
-
     try:
+        logger.info("Loading probe audio...")
+        probe_waveform = await _load_uploaded_audio(file)
+        logger.info(f"Probe waveform shape: {probe_waveform.shape}, dtype: {probe_waveform.dtype}")
+        probe_duration = probe_waveform.shape[-1] / TARGET_SR
+        if probe_duration < 2.0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Recording too short ({probe_duration:.1f}s of speech detected). Please speak clearly for at least 2 seconds and try again.",
+            )
+        enroll_waveform = None
+        if enroll_file:
+            enroll_waveform = await _load_uploaded_audio(enroll_file)
+        # Verify challenge phrase before running speaker verification
+        ok, detail = _transcribe_and_verify(probe_waveform, session.challenge)
+        if not ok:
+            raise HTTPException(status_code=401, detail=f"Challenge phrase not spoken correctly — {detail}.")
+
+        logger.info("Running authentication pipeline...")
         result = _session_manager.authenticate(
             session_id=session_id,
             probe_waveform=probe_waveform,
@@ -346,11 +460,22 @@ async def authenticate(
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        logger.error(f"Authentication pipeline crashed: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {e}")
 
     logger.info(
         f"Auth attempt {session.total_attempts} for '{session.user_id}': "
         f"{result.decision.value} (sv={result.speaker_score:.3f} spoof={result.spoof_score:.3f})"
     )
+
+    # Persist terminal sessions to SQLite and remove from memory
+    if session.status.value != "active":
+        try:
+            _log_session(_session_manager.session_summary(session_id))
+            _session_manager.end_session(session_id)
+        except Exception as _e:
+            logger.warning(f"Failed to log session to DB: {_e}")
 
     return AuthResponse(
         decision=AuthDecisionEnum(result.decision.value),
@@ -371,15 +496,21 @@ async def authenticate(
 async def list_sessions(
     current_user: dict = Depends(require_role("admin", "ops")),
 ):
-    """List all active sessions. Requires admin or ops role."""
-    if not _session_manager:
-        return []
-    summaries = []
-    for session_id in list(_session_manager._sessions.keys()):
-        s = _session_manager.session_summary(session_id)
-        if s:
-            summaries.append(s)
-    return summaries
+    """List all sessions — merges SQLite history with active in-memory sessions."""
+    # Logged (completed) sessions from SQLite
+    logged = _list_session_logs()
+    logged_ids = {s["session_id"] for s in logged}
+
+    # Active sessions still in memory (not yet logged)
+    active = []
+    if _session_manager:
+        for sid in list(_session_manager._sessions.keys()):
+            if sid not in logged_ids:
+                s = _session_manager.session_summary(sid)
+                if s:
+                    active.append(s)
+
+    return active + logged
 
 
 @app.get("/sessions/{session_id}", response_model=SessionResponse, tags=["Authentication"])
@@ -418,6 +549,15 @@ async def get_user(user_id: str):
     return UserStatusResponse(user_id=user_id, enrolled=enrolled)
 
 
+@app.get("/audit", tags=["Admin"])
+async def get_audit_log(
+    limit: int = 500,
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Admin only — retrieve the audit log."""
+    return _list_audit_logs(limit=limit)
+
+
 @app.get("/users", tags=["Enrollment"])
 async def get_all_users(current_user: dict = Depends(get_current_user)):
     """List all enrolled voice users."""
@@ -434,4 +574,5 @@ async def remove_user(
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found.")
     delete_user(user_id)
     logger.info(f"Deleted enrollment for user '{user_id}' by admin '{current_user['username']}'")
+    _log_audit(current_user["username"], "delete_voice", user_id)
     return DeleteUserResponse(user_id=user_id, deleted=True)

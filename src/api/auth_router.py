@@ -155,22 +155,31 @@ async def list_users():
     return {"users": list_app_users()}
 
 
-@router.patch("/users/{username}", dependencies=[Depends(require_role("admin"))])
-async def change_role(username: str, body: UpdateRoleRequest):
+@router.patch("/users/{username}")
+async def change_role(
+    username: str,
+    body: UpdateRoleRequest,
+    current_user: dict = Depends(require_role("admin")),
+):
     """Admin only — change a user's role."""
-    from src.api.app_db import update_role
+    from src.api.app_db import update_role, log_audit
     try:
         update_role(username, body.role)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    log_audit(current_user["username"], "change_role", username, f"role={body.role}")
     return {"username": username, "role": body.role}
 
 
-@router.delete("/users/{username}", status_code=204, dependencies=[Depends(require_role("admin"))])
-async def remove_user(username: str):
+@router.delete("/users/{username}", status_code=204)
+async def remove_user(
+    username: str,
+    current_user: dict = Depends(require_role("admin")),
+):
     """Admin only — delete an app account."""
-    from src.api.app_db import delete_app_user
+    from src.api.app_db import delete_app_user, log_audit
     try:
         delete_app_user(username)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    log_audit(current_user["username"], "delete_account", username)

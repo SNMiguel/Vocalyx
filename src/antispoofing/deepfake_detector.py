@@ -207,16 +207,12 @@ class SpectralAntiSpoof:
 
 class HFAntiSpoof:
     """
-    Loads a HuggingFace Wav2Vec2-style model fine-tuned for anti-spoofing.
-
-    Recommended models (ASVspoof-trained):
-      - "jungjee/HuBERT-base-AS"        (HuBERT, ASVspoof2019 LA)
-      - "m3hrdadfi/wav2vec2-base-100k-voxpopuli-v2"  (general, less specialized)
-
+    Loads a HuggingFace Wav2Vec2-style model fine-tuned for deepfake/spoof detection.
+    Default: motheecreator/Deepfake-audio-detection (Wav2Vec2, label 0=fake, label 1=real).
     Falls back to SpectralAntiSpoof if the model fails to load or score.
     """
 
-    def __init__(self, model_id: str = "jungjee/HuBERT-base-AS"):
+    def __init__(self, model_id: str = "motheecreator/Deepfake-audio-detection"):
         self._model_id = model_id
         self._model = None
         self._extractor = None
@@ -224,10 +220,24 @@ class HFAntiSpoof:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def _load(self):
-        from transformers import Wav2Vec2FeatureExtractor, HubertForSequenceClassification
-        self._extractor = Wav2Vec2FeatureExtractor.from_pretrained(self._model_id)
-        self._model = HubertForSequenceClassification.from_pretrained(self._model_id)
-        self._model.eval().to(self._device)
+        import sys
+
+        # transformers calls is_speechbrain_available() during from_pretrained(),
+        # which accesses SpeechBrain's lazy integration stubs (k2_fsa, etc.) and
+        # raises ImportError. Temporarily hide all SpeechBrain modules so
+        # transformers treats it as not installed, then restore afterward.
+        sb_snapshot = {k: v for k, v in list(sys.modules.items())
+                       if k == "speechbrain" or k.startswith("speechbrain.")}
+        for key in sb_snapshot:
+            sys.modules.pop(key, None)
+
+        try:
+            from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
+            self._extractor = Wav2Vec2FeatureExtractor.from_pretrained(self._model_id)
+            self._model = Wav2Vec2ForSequenceClassification.from_pretrained(self._model_id)
+            self._model.eval().to(self._device)
+        finally:
+            sys.modules.update(sb_snapshot)
 
     def predict(self, waveform: torch.Tensor) -> SpoofResult:
         try:
@@ -244,11 +254,8 @@ class HFAntiSpoof:
                 logits = self._model(**inputs).logits.squeeze()
 
             probs = torch.softmax(logits, dim=-1)
-            # Convention: label 0 = real, label 1 = spoof (ASVspoof standard)
-            if probs.shape[0] >= 2:
-                spoof_score = float(probs[1])
-            else:
-                spoof_score = float(1.0 - probs[0])
+            # This model: label 0 = fake (spoof), label 1 = real
+            spoof_score = float(probs[0]) if probs.shape[0] >= 2 else float(1.0 - probs[0])
 
             confidence = abs(spoof_score - 0.5) * 2.0
             return SpoofResult(
@@ -267,18 +274,34 @@ class HFAntiSpoof:
 # ── convenience factory ───────────────────────────────────────────────────────
 
 _default_detector: SpectralAntiSpoof | None = None
+_hf_detector: HFAntiSpoof | None = None
+
+import logging as _logging
+_antispoof_log = _logging.getLogger("voice_biometrics.antispoof")
+
+
+def load_hf_model(model_id: str = "motheecreator/Deepfake-audio-detection") -> bool:
+    """Eagerly load HuggingFace anti-spoof model. Call once at server startup."""
+    global _hf_detector
+    try:
+        detector = HFAntiSpoof(model_id)
+        detector._load()
+        _hf_detector = detector
+        _antispoof_log.info(f"HuBERT anti-spoof model loaded: {model_id}")
+        return True
+    except Exception as e:
+        _antispoof_log.warning(f"HuBERT anti-spoof model failed to load ({e}); using spectral fallback.")
+        return False
 
 
 def detect_spoof(waveform: torch.Tensor, use_hf: bool = False, hf_model: str = "jungjee/HuBERT-base-AS") -> SpoofResult:
     """
     Detect whether audio is real or synthetic/replayed.
-
-    Args:
-        waveform: (1, samples) 16kHz tensor
-        use_hf: if True, use HuggingFace model (requires download); else spectral
-        hf_model: HuggingFace model ID to use when use_hf=True
+    Uses the HuBERT model if loaded at startup, otherwise falls back to spectral.
     """
-    global _default_detector
+    global _default_detector, _hf_detector
+    if _hf_detector is not None:
+        return _hf_detector.predict(waveform)
     if use_hf:
         return HFAntiSpoof(hf_model).predict(waveform)
     if _default_detector is None:
