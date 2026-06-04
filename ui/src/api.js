@@ -1,4 +1,5 @@
-const BASE = '/api'
+// In dev: Vite proxies /api → localhost:8000. In prod: set VITE_API_URL to the Railway URL.
+const BASE = import.meta.env.VITE_API_URL ?? '/api'
 
 export class ApiError extends Error {
   constructor(status, detail) {

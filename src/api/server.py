@@ -109,12 +109,12 @@ async def lifespan(app: FastAPI):
 
     auth_cfg = cfg.get("auth", {})
     _auth_mod.configure(
-        secret_key=auth_cfg.get("secret_key", "change-me"),
+        secret_key=os.getenv("SECRET_KEY") or auth_cfg.get("secret_key", "change-me"),
         expire_minutes=auth_cfg.get("token_expire_minutes", 60),
     )
     init_db(
-        admin_username=auth_cfg.get("admin_username", "admin"),
-        admin_password=auth_cfg.get("admin_password", "admin123"),
+        admin_username=os.getenv("ADMIN_USERNAME") or auth_cfg.get("admin_username", "admin"),
+        admin_password=os.getenv("ADMIN_PASSWORD") or auth_cfg.get("admin_password", "admin123"),
     )
     _init_audit_log()
 

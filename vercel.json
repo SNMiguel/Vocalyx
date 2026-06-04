@@ -1,0 +1,6 @@
+{
+  "buildCommand": "cd ui && npm install && npm run build",
+  "outputDirectory": "ui/dist",
+  "installCommand": "echo 'deps installed in buildCommand'",
+  "framework": null
+}
