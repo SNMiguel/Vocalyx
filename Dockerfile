@@ -1,14 +1,12 @@
 FROM python:3.10-slim
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# CPU-only PyTorch — avoids 2GB+ GPU builds; all models run fine on CPU
-RUN pip install --no-cache-dir \
-    torch==2.1.2+cpu \
-    torchaudio==2.1.2+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
+# ARM64 (Oracle Ampere A1): standard PyPI wheels are CPU-only on this arch — no +cpu index needed
+# x86_64: also works; pip selects the right wheel automatically
+RUN pip install --no-cache-dir torch torchaudio
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
