@@ -2,7 +2,7 @@
 
 **A complete voice biometric authentication system — neural speaker verification, deepfake detection, challenge-response, and a full React dashboard.**
 
-Vocalyx is a production-ready voice authentication platform that verifies speakers reliably across real-world conditions — different devices, languages, accents, and vocal states — while defending against modern AI voice cloning and replay attacks.
+Vocalyx is a production-ready voice authentication platform that verifies speakers reliably across real-world conditions — different devices, languages, accents, and vocal states — while defending against modern AI voice cloning and various replay attacks.
 
 ---
 
