@@ -229,3 +229,109 @@ def list_session_logs() -> list[dict]:
             "attempts":       json.loads(r["attempts_json"] or "[]"),
         })
     return result
+
+
+# ── model tests (admin Model Testing feature) ─────────────────────────────────
+
+# Columns shared by INSERT and row-reads (mirror of the model_tests schema, minus id).
+# voice_model = TTS engine/model (e.g. "speech-2.8-hd"); voice = speaker (e.g. "Calm Woman").
+_MODEL_TEST_COLUMNS = (
+    "test_id", "model_type", "filename", "voice_model", "voice", "language", "notes",
+    "predicted_label", "confidence", "deepfake_prob", "genuine_prob",
+    "duration_ms", "inference_ms", "tested_by", "tested_at", "raw_output",
+)
+
+
+def init_model_tests() -> None:
+    """Create the model_tests table if it doesn't exist. Called at server startup."""
+    with _conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS model_tests (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_id         TEXT UNIQUE NOT NULL,
+                model_type      TEXT NOT NULL,
+                filename        TEXT NOT NULL,
+                voice_model     TEXT,
+                voice           TEXT,
+                language        TEXT,
+                notes           TEXT,
+                predicted_label TEXT,
+                confidence      REAL,
+                deepfake_prob   REAL,
+                genuine_prob    REAL,
+                duration_ms     INTEGER,
+                inference_ms    INTEGER,
+                tested_by       TEXT NOT NULL,
+                tested_at       TEXT NOT NULL,
+                raw_output      TEXT
+            )
+        """)
+        # Migrate DBs created before the `voice` column existed.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(model_tests)").fetchall()}
+        if "voice" not in cols:
+            conn.execute("ALTER TABLE model_tests ADD COLUMN voice TEXT")
+
+
+def insert_model_test(record: dict) -> None:
+    """Insert one model-test result. record keys must cover _MODEL_TEST_COLUMNS."""
+    cols = ", ".join(_MODEL_TEST_COLUMNS)
+    placeholders = ", ".join("?" for _ in _MODEL_TEST_COLUMNS)
+    values = tuple(record.get(c) for c in _MODEL_TEST_COLUMNS)
+    with _conn() as conn:
+        conn.execute(
+            f"INSERT INTO model_tests ({cols}) VALUES ({placeholders})", values
+        )
+
+
+def _row_to_model_test(r) -> dict:
+    return {k: r[k] for k in ("id", *_MODEL_TEST_COLUMNS)}
+
+
+def _model_test_where(model_type=None, date_from=None, date_to=None,
+                      tested_by=None, voice_model=None, voice=None) -> tuple[str, list]:
+    """Build a WHERE clause + params from optional filters. Dates are ISO 8601 strings."""
+    clauses, params = [], []
+    if model_type:
+        clauses.append("model_type = ?"); params.append(model_type)
+    if date_from:
+        clauses.append("tested_at >= ?"); params.append(date_from)
+    if date_to:
+        clauses.append("tested_at <= ?"); params.append(date_to)
+    if tested_by:
+        clauses.append("tested_by = ?"); params.append(tested_by)
+    if voice_model:
+        clauses.append("voice_model = ?"); params.append(voice_model)
+    if voice:
+        clauses.append("voice = ?"); params.append(voice)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def list_model_tests(model_type=None, date_from=None, date_to=None, tested_by=None,
+                     voice_model=None, voice=None, limit=50, offset=0) -> list[dict]:
+    """Return model-test results matching the filters, newest first, paginated."""
+    where, params = _model_test_where(model_type, date_from, date_to, tested_by, voice_model, voice)
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM model_tests{where} ORDER BY tested_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+    return [_row_to_model_test(r) for r in rows]
+
+
+def count_model_tests(model_type=None, date_from=None, date_to=None,
+                      tested_by=None, voice_model=None, voice=None) -> int:
+    """Total number of model-test results matching the filters (for pagination)."""
+    where, params = _model_test_where(model_type, date_from, date_to, tested_by, voice_model, voice)
+    with _conn() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM model_tests{where}", params
+        ).fetchone()
+    return int(row["n"])
+
+
+def delete_model_test(test_id: str) -> bool:
+    """Delete one model-test result by test_id. Returns True if a row was removed."""
+    with _conn() as conn:
+        cur = conn.execute("DELETE FROM model_tests WHERE test_id = ?", (test_id,))
+    return cur.rowcount > 0

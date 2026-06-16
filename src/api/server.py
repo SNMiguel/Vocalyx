@@ -49,6 +49,11 @@ from src.api.app_db import (
     init_audit_log as _init_audit_log,
     log_audit as _log_audit,
     list_audit_logs as _list_audit_logs,
+    init_model_tests as _init_model_tests,
+    insert_model_test as _insert_model_test,
+    list_model_tests as _list_model_tests,
+    count_model_tests as _count_model_tests,
+    delete_model_test as _delete_model_test,
 )
 from src.decision.fusion_layer import DecisionConfig, make_auth_decision
 from src.decision.session import SessionManager, SessionConfig
@@ -77,6 +82,11 @@ TARGET_SR = 16000
 MAX_AUDIO_BYTES = 50 * 1024 * 1024   # 50 MB
 MIN_ENROLL_SPEECH_SECONDS = 10.0     # minimum total speech time after VAD
 
+# ── Model Testing (admin) limits ──────────────────────────────────────────────
+TEST_MAX_FILE_BYTES = 25 * 1024 * 1024            # 25 MB per file
+TEST_MAX_BATCH = 10                               # files per request
+TEST_ALLOWED_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
 # ── rate limiting (in-memory, per IP) ────────────────────────────────────────
 
 from collections import defaultdict as _defaultdict
@@ -91,6 +101,22 @@ def _is_rate_limited(ip: str) -> bool:
     if len(bucket) >= _RATE_MAX:
         return True
     _rate_buckets[ip].append(now)
+    return False
+
+
+# Per-admin rate limiting for the Model Testing feature (one "test" == one file).
+_test_rate_buckets: dict[str, list[float]] = _defaultdict(list)
+_TEST_RATE_WINDOW = 600.0   # 10 minutes
+_TEST_RATE_MAX    = 30      # max tests per admin per window
+
+def _test_rate_limited(admin: str, n: int) -> bool:
+    """Return True if running `n` more tests would exceed the admin's quota."""
+    now = time.time()
+    bucket = [t for t in _test_rate_buckets[admin] if now - t < _TEST_RATE_WINDOW]
+    _test_rate_buckets[admin] = bucket
+    if len(bucket) + n > _TEST_RATE_MAX:
+        return True
+    bucket.extend([now] * n)
     return False
 
 
@@ -117,6 +143,7 @@ async def lifespan(app: FastAPI):
         admin_password=os.getenv("ADMIN_PASSWORD") or auth_cfg.get("admin_password", "admin123"),
     )
     _init_audit_log()
+    _init_model_tests()
 
     _decision_config = DecisionConfig()
     _session_manager = SessionManager(
@@ -576,3 +603,212 @@ async def remove_user(
     logger.info(f"Deleted enrollment for user '{user_id}' by admin '{current_user['username']}'")
     _log_audit(current_user["username"], "delete_voice", user_id)
     return DeleteUserResponse(user_id=user_id, deleted=True)
+
+
+# ── Model Testing (admin only) ────────────────────────────────────────────────
+#
+# Run individual Vocalyx ML components in isolation against arbitrary audio,
+# bypassing the full authentication flow (no Whisper challenge, speaker
+# verification, replay/channel/decision layers). Initial model: deepfake detector.
+
+def _safe_filename(name: str | None) -> str:
+    """Strip any directory components to prevent path traversal before storage."""
+    return Path(name or "audio").name or "audio"
+
+
+def _iso_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/admin/test/deepfake", tags=["Model Testing"])
+async def test_deepfake(
+    files: Annotated[list[UploadFile], File()],
+    voice_model: Annotated[Optional[str], Form()] = None,
+    voice: Annotated[Optional[str], Form()] = None,
+    language: Annotated[Optional[str], Form()] = None,
+    notes: Annotated[Optional[str], Form()] = None,
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Run ONLY the Wav2Vec2 deepfake detector on one or more uploaded audio files.
+
+    Skips the quality gate so short TTS clips are still scored. Each file is
+    processed independently — decode/runtime errors are reported per file
+    rather than failing the whole batch.
+    """
+    from src.api.model_testing import run_deepfake_test, MODEL_DEEPFAKE
+
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one audio file required.")
+    if len(files) > TEST_MAX_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch too large: {len(files)} files (max {TEST_MAX_BATCH}). Split client-side.",
+        )
+
+    # Structural validation up front (type + size) → request-level rejection.
+    for f in files:
+        ext = Path(f.filename or "").suffix.lower()
+        if ext not in TEST_ALLOWED_EXTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsupported file type '{ext or '?'}' for '{f.filename}'. "
+                       f"Allowed: {', '.join(sorted(TEST_ALLOWED_EXTS))}.",
+            )
+        if f.size is not None and f.size > TEST_MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"'{f.filename}' exceeds {TEST_MAX_FILE_BYTES // (1024*1024)} MB limit.",
+            )
+
+    admin = current_user["username"]
+    if _test_rate_limited(admin, len(files)):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit: max {_TEST_RATE_MAX} tests per "
+                   f"{int(_TEST_RATE_WINDOW // 60)} minutes. Please wait.",
+        )
+
+    results = []
+    for f in files:
+        filename = _safe_filename(f.filename)
+        try:
+            waveform = await _load_uploaded_audio(f)
+            if waveform.shape[-1] == 0:
+                raise ValueError("No audio remained after preprocessing (silent or too short).")
+            outcome = run_deepfake_test(waveform)
+            record = {
+                "test_id": f"test_{uuid.uuid4().hex[:8]}",
+                "model_type": MODEL_DEEPFAKE,
+                "filename": filename,
+                "voice_model": voice_model or None,
+                "voice": voice or None,
+                "language": language or None,
+                "notes": notes or None,
+                "tested_by": admin,
+                "tested_at": _iso_now(),
+                **outcome,
+            }
+            _insert_model_test(record)
+            results.append({"status": "complete", **record})
+        except HTTPException as e:
+            results.append({"status": "failed", "filename": filename, "error": e.detail})
+        except Exception as e:
+            logger.warning(f"Deepfake test failed for '{filename}': {e}")
+            results.append({"status": "failed", "filename": filename, "error": str(e)})
+
+    completed = sum(1 for r in results if r["status"] == "complete")
+    failed = len(results) - completed
+    _log_audit(admin, "model_test_run", MODEL_DEEPFAKE,
+               f"files={len(files)} ok={completed} failed={failed}")
+
+    return {"results": results, "completed": completed, "failed": failed, "total": len(results)}
+
+
+def _inclusive_date_to(date_to: Optional[str]) -> Optional[str]:
+    """Make a bare 'YYYY-MM-DD' upper bound inclusive of the whole day."""
+    if date_to and len(date_to) == 10:
+        return date_to + "T23:59:59.999999"
+    return date_to
+
+
+@app.get("/admin/test/history", tags=["Model Testing"])
+async def test_history(
+    model_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    voice_model: Optional[str] = None,
+    voice: Optional[str] = None,
+    tested_by: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Paginated list of past test results, filterable by model, date range, admin, voice model, voice."""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+    offset = (page - 1) * page_size
+    filters = dict(model_type=model_type, date_from=date_from,
+                   date_to=_inclusive_date_to(date_to),
+                   voice_model=voice_model, voice=voice, tested_by=tested_by)
+    total = _count_model_tests(**filters)
+    rows = _list_model_tests(**filters, limit=page_size, offset=offset)
+    return {"results": rows, "total": total, "page": page, "page_size": page_size}
+
+
+def _build_export_workbook(rows: list[dict]) -> bytes:
+    """Render test rows to an .xlsx with a frozen, auto-sized header row."""
+    from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
+
+    columns = [
+        ("Test ID", "test_id"),
+        ("Filename", "filename"),
+        ("Voice Model", "voice_model"),
+        ("Voice", "voice"),
+        ("Language", "language"),
+        ("Predicted Label", "predicted_label"),
+        ("Confidence", "confidence"),
+        ("Deepfake Probability", "deepfake_prob"),
+        ("Genuine Probability", "genuine_prob"),
+        ("Duration (ms)", "duration_ms"),
+        ("Inference Time (ms)", "inference_ms"),
+        ("Tested By", "tested_by"),
+        ("Tested At", "tested_at"),
+        ("Notes", "notes"),
+    ]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Model Tests"
+    ws.append([h for h, _ in columns])
+    for r in rows:
+        ws.append([r.get(key) for _, key in columns])
+    ws.freeze_panes = "A2"
+    for i, (header, key) in enumerate(columns, start=1):
+        width = max(len(header), *(len(str(r.get(key) or "")) for r in rows)) if rows else len(header)
+        ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 10), 60)
+
+    import io as _io
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@app.get("/admin/test/export", tags=["Model Testing"])
+async def test_export(
+    model_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    voice_model: Optional[str] = None,
+    voice: Optional[str] = None,
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Export filtered test results as an Excel file."""
+    from fastapi.responses import Response
+
+    rows = _list_model_tests(
+        model_type=model_type, date_from=date_from,
+        date_to=_inclusive_date_to(date_to), voice_model=voice_model, voice=voice,
+        limit=100_000, offset=0,
+    )
+    data = _build_export_workbook(rows)
+    _log_audit(current_user["username"], "model_test_export",
+               model_type or "all", f"rows={len(rows)}")
+    filename = f"vocalyx_model_tests_{_iso_now()[:10]}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.delete("/admin/test/{test_id}", tags=["Model Testing"])
+async def delete_test(
+    test_id: str,
+    current_user: dict = Depends(require_role("admin")),
+):
+    """Delete a single test result (admin cleanup)."""
+    if not _delete_model_test(test_id):
+        raise HTTPException(status_code=404, detail=f"Test '{test_id}' not found.")
+    _log_audit(current_user["username"], "model_test_delete", test_id)
+    return {"test_id": test_id, "deleted": True}
