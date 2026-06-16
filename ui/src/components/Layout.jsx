@@ -61,6 +61,7 @@ export default function Layout({ children }) {
               <SidebarLink to="/users" icon="👤" label="Voice Users" />
               <SidebarLink to="/app-users" icon="🔑" label="App Users" />
               <SidebarLink to="/audit" icon="📜" label="Audit Log" />
+              <SidebarLink to="/model-testing" icon="🧪" label="Model Testing" />
             </>
           )}
         </aside>

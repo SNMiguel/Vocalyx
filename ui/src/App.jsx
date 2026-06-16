@@ -11,6 +11,7 @@ import Sessions from './pages/Sessions'
 import Users from './pages/Users'
 import AppUsers from './pages/AppUsers'
 import AuditLog from './pages/AuditLog'
+import ModelTesting from './pages/ModelTesting'
 
 export default function App() {
   return (
@@ -57,6 +58,14 @@ export default function App() {
                       element={
                         <ProtectedRoute roles={['admin']}>
                           <AuditLog />
+                        </ProtectedRoute>
+                      }
+                    />
+                    <Route
+                      path="/model-testing"
+                      element={
+                        <ProtectedRoute roles={['admin']}>
+                          <ModelTesting />
                         </ProtectedRoute>
                       }
                     />
